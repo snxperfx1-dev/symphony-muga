@@ -688,6 +688,24 @@ double GetDirectionFloatingPnL(int direction)
    return total;
 }
 
+// Returns number of open positions in one direction.
+int GetDirectionPositionCount(int direction)
+{
+   int cnt = 0;
+   int total = PositionsTotal();
+   for(int i = 0; i < total; i++)
+   {
+      ulong ticket = PositionGetTicket(i);
+      if(!PositionSelectByTicket(ticket)) continue;
+      if(PositionGetString(POSITION_SYMBOL) != _Symbol)   continue;
+      if(PositionGetInteger(POSITION_MAGIC)  != InpMagic) continue;
+      long type = PositionGetInteger(POSITION_TYPE);
+      if((type == POSITION_TYPE_BUY ? 1 : -1) != direction) continue;
+      cnt++;
+   }
+   return cnt;
+}
+
 // Move all remaining stops in a direction to at least breakeven (entry price).
 // For longs: SL must be >= entry. For shorts: SL must be <= entry.
 // Called once when Rung 1 fires. Prevents a full reversal eating
@@ -992,14 +1010,16 @@ void ExecuteTrading()
    double impS = g_anchorHigh - g_anchorLow;
 
    // Counter-direction block:
-   // Do not open longs while the short book is net profitable, and vice versa.
-   // A counter-trend bounce inside a running profitable campaign is not a
-   // new campaign — it is noise. Opening against a profitable book destroys
-   // net P&L even when both sides eventually work.
-   bool shortBookProfitable = (GetDirectionFloatingPnL(-1) > 0.0);
-   bool longBookProfitable  = (GetDirectionFloatingPnL( 1) > 0.0);
-   if(shortBookProfitable) { L3 = false; L4 = false; }
-   if(longBookProfitable)  { S3 = false; S4 = false; }
+   // Block long entries if ANY short positions are open (profitable or losing).
+   // Block short entries if ANY long positions are open.
+   // Previous version only blocked when the opposing book was profitable —
+   // this allowed longs to open during losing short campaigns, causing
+   // simultaneous losses on both sides and the consecutive drawdown.
+   // Correct rule: if an opposing campaign is running at all, stay out.
+   bool shortBookOpen = (GetDirectionPositionCount(-1) > 0);
+   bool longBookOpen  = (GetDirectionPositionCount( 1) > 0);
+   if(shortBookOpen) { L3 = false; L4 = false; }
+   if(longBookOpen)  { S3 = false; S4 = false; }
 
    // --- LONG P3 ---
    if(L3 && g_lastLongTradeTime != barTime)
