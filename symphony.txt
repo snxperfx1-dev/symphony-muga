@@ -91,6 +91,19 @@ input double InpCampaignVarMult   = 1.0;    // Scale on campaign VaR limits (>1 
 input double InpHardBreachMult    = 2.0;    // Overage ratio that blocks new entries (hard breach)
 input double InpLiqLookbackBars   = 120;    // Lookback for dynamic liquidity / swing levels
 
+//==================================================================
+// 2C. INPUTS - PROFIT PROTECTION / EXIT MANAGER
+//==================================================================
+// These run on EVERY bar for EVERY EA position, independent of the impulse
+// state (g_mode), so winners are protected even after the impulse resets/flips.
+input bool   InpUseTrailing       = true;   // Breakeven + ATR trailing stop
+input double InpBETriggerAtr      = 1.0;    // Move SL to breakeven after this favorable move (ATR)
+input double InpBELockAtr         = 0.10;   // Breakeven lock buffer beyond entry (ATR)
+input double InpTrailStartAtr     = 1.5;    // Start trailing after this favorable move (ATR)
+input double InpTrailDistAtr      = 1.5;    // Trailing distance kept behind price (ATR)
+input bool   InpExitOnFlip        = false;  // Also close a leg if a fresh opposite impulse forms
+input bool   InpUseArcTP          = false;  // Place a hard TP at the ARC extension target on entry
+
 // Timing - target session timezone (GMT baseline)
 input int    InpTargetGMT         = 0;      // Target session timezone (GMT offset)
 
@@ -1261,7 +1274,7 @@ void RE_DecideTrim(RE_Metrics &m, RE_Config &cfg, int level, RE_Trim &t)
 //==================================================================
 // 12. RAW ORDER EXECUTION HELPERS (IOC)
 //==================================================================
-bool SendMarketOrder(int direction, double lots, double sl, const string comment)
+bool SendMarketOrder(int direction, double lots, double sl, double tp, const string comment)
 {
    if(lots <= 0.0) return(false);
 
@@ -1278,7 +1291,7 @@ bool SendMarketOrder(int direction, double lots, double sl, const string comment
    req.magic       = InpMagic;
    req.volume      = lots;
    req.sl          = sl;
-   req.tp          = 0.0;
+   req.tp          = (tp > 0.0 ? tp : 0.0);
    req.deviation   = 20;
    req.type_filling= ORDER_FILLING_IOC;
    req.type_time   = ORDER_TIME_GTC;
@@ -1376,6 +1389,44 @@ bool ClosePositionFull(ulong ticket)
    if(!PositionSelectByTicket(ticket)) return(false);
    double lots = PositionGetDouble(POSITION_VOLUME);
    return(ClosePositionPartial(ticket,lots));
+}
+
+// Move an existing position's stop-loss (used by the trailing/breakeven manager).
+bool ModifyPositionSL(ulong ticket, double newSL)
+{
+   if(!PositionSelectByTicket(ticket)) return(false);
+   if(PositionGetString(POSITION_SYMBOL) != _Symbol) return(false);
+   if(PositionGetInteger(POSITION_MAGIC) != InpMagic) return(false);
+
+   double curSL = PositionGetDouble(POSITION_SL);
+   double curTP = PositionGetDouble(POSITION_TP);
+
+   int digits = (int)SymbolInfoInteger(_Symbol,SYMBOL_DIGITS);
+   newSL = NormalizeDouble(newSL,digits);
+   if(MathAbs(newSL - curSL) < _Point) return(false); // nothing meaningful to change
+
+   MqlTradeRequest req;
+   MqlTradeResult  res;
+   ZeroMemory(req);
+   ZeroMemory(res);
+
+   req.action   = TRADE_ACTION_SLTP;
+   req.symbol   = _Symbol;
+   req.position = ticket;
+   req.sl       = newSL;
+   req.tp       = curTP;
+
+   if(!OrderSend(req,res))
+   {
+      Print("ModifyPositionSL failed ticket=",ticket," sl=",newSL," retcode=",res.retcode);
+      return(false);
+   }
+   if(res.retcode != TRADE_RETCODE_DONE)
+   {
+      Print("ModifyPositionSL not DONE ticket=",ticket," retcode=",res.retcode);
+      return(false);
+   }
+   return(true);
 }
 
 //==================================================================
@@ -1722,15 +1773,21 @@ void ExecuteTrading()
    double impL = g_anchorHigh - g_anchorLow;
    double impS = g_anchorHigh - g_anchorLow;
 
+   // Optional hard TP at the ARC extension destination (off by default; the
+   // trailing manager is the primary profit-taker).
+   double tpLong  = (InpUseArcTP && impL > 0.0 ? g_anchorLow  + impL * InpArcExtMult : 0.0);
+   double tpShort = (InpUseArcTP && impS > 0.0 ? g_anchorHigh - impS * InpArcExtMult : 0.0);
+
    // LONG P3
    if(L3 && g_lastLongTradeTime!=barTime)
    {
       double entry = closeNow;
       double sl    = g_anchorLow - atrNow*0.25;
       double lots  = ComputeLots(riskCash,entry,sl);
+      double tp    = (tpLong > entry ? tpLong : 0.0);
       if(sl>0 && entry>sl && lots>0)
       {
-         if(SendMarketOrder(+1,lots,sl,"SYM P3 Long"))
+         if(SendMarketOrder(+1,lots,sl,tp,"SYM P3 Long"))
             g_lastLongTradeTime=barTime;
       }
    }
@@ -1744,9 +1801,10 @@ void ExecuteTrading()
          double entry = closeNow;
          double sl    = g_anchorLow - atrNow*0.25;
          double lots  = ComputeLots(riskCash,entry,sl);
+         double tp    = (tpLong > entry ? tpLong : 0.0);
          if(sl>0 && entry>sl && lots>0)
          {
-            if(SendMarketOrder(+1,lots,sl,"SYM P4 Long"))
+            if(SendMarketOrder(+1,lots,sl,tp,"SYM P4 Long"))
                g_lastLongTradeTime=barTime;
          }
       }
@@ -1758,9 +1816,10 @@ void ExecuteTrading()
       double entry = closeNow;
       double sl    = g_anchorHigh + atrNow*0.25;
       double lots  = ComputeLots(riskCash,entry,sl);
+      double tp    = (tpShort > 0.0 && tpShort < entry ? tpShort : 0.0);
       if(sl>0 && sl>entry && lots>0)
       {
-         if(SendMarketOrder(-1,lots,sl,"SYM P3 Short"))
+         if(SendMarketOrder(-1,lots,sl,tp,"SYM P3 Short"))
             g_lastShortTradeTime=barTime;
       }
    }
@@ -1774,9 +1833,10 @@ void ExecuteTrading()
          double entry = closeNow;
          double sl    = g_anchorHigh + atrNow*0.25;
          double lots  = ComputeLots(riskCash,entry,sl);
+         double tp    = (tpShort > 0.0 && tpShort < entry ? tpShort : 0.0);
          if(sl>0 && sl>entry && lots>0)
          {
-            if(SendMarketOrder(-1,lots,sl,"SYM P4 Short"))
+            if(SendMarketOrder(-1,lots,sl,tp,"SYM P4 Short"))
                g_lastShortTradeTime=barTime;
          }
       }
@@ -1900,6 +1960,95 @@ void ManageArcInstitutionalExits()
 }
 
 //==================================================================
+// 16B. PROFIT PROTECTION - BREAKEVEN + ATR TRAILING + FLIP EXIT
+//      Runs every bar for every EA position, INDEPENDENT of g_mode,
+//      so winners are protected/booked even after the impulse that
+//      created them has reset or flipped (the old orphan problem).
+//==================================================================
+void ManageProfitProtection()
+{
+   if(!InpUseTrailing && !InpExitOnFlip) return;
+
+   double atr = GetATR(1);
+   if(atr <= 0.0) return;
+
+   double bid = SymbolInfoDouble(_Symbol,SYMBOL_BID);
+   double ask = SymbolInfoDouble(_Symbol,SYMBOL_ASK);
+   long   stopsLvl = SymbolInfoInteger(_Symbol,SYMBOL_TRADE_STOPS_LEVEL);
+   double minDist  = stopsLvl * _Point;
+
+   int total = PositionsTotal();
+   for(int i = total-1; i >= 0; i--)
+   {
+      ulong ticket = PositionGetTicket(i);
+      if(!PositionSelectByTicket(ticket)) continue;
+      if(PositionGetString(POSITION_SYMBOL) != _Symbol) continue;
+      if(PositionGetInteger(POSITION_MAGIC) != InpMagic) continue;
+
+      long   type  = PositionGetInteger(POSITION_TYPE);
+      double entry = PositionGetDouble(POSITION_PRICE_OPEN);
+      double curSL = PositionGetDouble(POSITION_SL);
+
+      if(type == POSITION_TYPE_BUY)
+      {
+         // Flip exit: a genuine fresh down-impulse has formed against the long.
+         if(InpExitOnFlip && g_mode == -1)
+         {
+            ClosePositionFull(ticket);
+            continue;
+         }
+         if(!InpUseTrailing) continue;
+
+         double fav   = bid - entry;       // favorable move (long)
+         double newSL = curSL;
+
+         if(fav >= InpBETriggerAtr * atr)
+         {
+            double be = entry + InpBELockAtr * atr;
+            if(be > newSL) newSL = be;
+         }
+         if(fav >= InpTrailStartAtr * atr)
+         {
+            double tsl = bid - InpTrailDistAtr * atr;
+            if(tsl > newSL) newSL = tsl;
+         }
+
+         // Only ever tighten, and keep a legal distance below price.
+         if(newSL > curSL && newSL <= bid - minDist)
+            ModifyPositionSL(ticket, newSL);
+      }
+      else // POSITION_TYPE_SELL
+      {
+         if(InpExitOnFlip && g_mode == 1)
+         {
+            ClosePositionFull(ticket);
+            continue;
+         }
+         if(!InpUseTrailing) continue;
+
+         double fav   = entry - ask;       // favorable move (short)
+         double newSL = curSL;
+         bool   noSL  = (curSL <= 0.0);
+
+         if(fav >= InpBETriggerAtr * atr)
+         {
+            double be = entry - InpBELockAtr * atr;
+            if(noSL || be < newSL) newSL = be;
+         }
+         if(fav >= InpTrailStartAtr * atr)
+         {
+            double tsl = ask + InpTrailDistAtr * atr;
+            if(noSL || tsl < newSL) newSL = tsl;
+         }
+
+         // Only ever tighten (lower SL for a short), keep a legal distance above price.
+         if((noSL || newSL < curSL) && newSL >= ask + minDist)
+            ModifyPositionSL(ticket, newSL);
+      }
+   }
+}
+
+//==================================================================
 // 17. STANDARD CALLBACKS
 //==================================================================
 int OnInit()
@@ -2014,6 +2163,9 @@ void OnTick()
 
    // 4) ARC + institutional + phase composite exits (replaces old structural TP)
    ManageArcInstitutionalExits();
+
+   // 4B) Breakeven + trailing-stop + flip exit (impulse-independent profit lock)
+   ManageProfitProtection();
 
    // 5) Open new Phase 3 / Phase 4 trades (time-gated inside)
    ExecuteTrading();
