@@ -150,6 +150,15 @@ input bool   InpVolFilter         = true;   // Suppress entries in high-ATR stat
 input int    InpVolLookback        = 100;    // Bars for ATR percentile ranking
 input double InpVolBlockPctile     = 0.66;   // Block if ATR rank >= this percentile
 
+//==================================================================
+// 1J. R-9 AUDIT INSTRUMENTATION
+// Writes structured ENTRY/EXIT lines to the journal so the next
+// backtest is fully auditable: signal type, structure (PDH/PDL,
+// premium/discount), HTF trend, volatility regime, session,
+// Asia-raid state, and TRUE per-position MFE/MAE in R units.
+//==================================================================
+input bool   InpAuditLog          = true;   // Emit SYM AUDIT ENTRY/EXIT lines
+
 
 //==================================================================
 // 2. GLOBAL STATE - PHASE ENGINE
@@ -255,6 +264,30 @@ struct PosEntry
    datetime openTime;
    double   lots;
 };
+
+//==================================================================
+// 6B. R-9 AUDIT TRACKING STRUCT
+// One slot per tracked position; records entry context + running
+// MFE/MAE for forensic logging on close.
+//==================================================================
+struct AuditPos
+{
+   long     ticket;
+   int      dir;
+   double   entry;
+   double   isl;       // initial SL -> R denominator
+   double   riskdist;
+   double   mfePrice;  // best favorable price seen
+   double   maePrice;  // worst adverse price seen
+   double   lastPrice;
+   datetime openTime;
+   string   sig;       // signal tag from order comment
+   string   ctx;       // entry context string (logged at entry)
+   bool     used;
+};
+AuditPos g_audit[256];
+int      g_auditCount = 0;
+
 
 //==================================================================
 // 7. BASIC HELPERS
@@ -1162,6 +1195,120 @@ bool IsHighVol()
    return (rank >= InpVolBlockPctile);
 }
 
+//==================================================================
+// 13E. R-9 AUDIT INSTRUMENTATION
+// AuditSync() runs every bar:
+//  - registers any newly-opened position (logs ENTRY context),
+//  - updates running MFE/MAE for tracked positions,
+//  - on disappearance (closed), logs EXIT with MFE/MAE/realized R.
+//==================================================================
+int AuditFind(long ticket)
+{
+   for(int i=0;i<g_auditCount;i++)
+      if(g_audit[i].used && g_audit[i].ticket==ticket) return i;
+   return -1;
+}
+
+string SessionName(int cur)
+{
+   if(cur < 420)  return "Asia";
+   if(cur < 720)  return "London";
+   if(cur < 960)  return "Overlap";
+   if(cur < 1200) return "NY";
+   return "LateNY";
+}
+
+void AuditRegister(long ticket, int dir, double entry, double sl, string comment)
+{
+   if(g_auditCount >= 256) return;
+   // structure context: previous day high/low + location in that range
+   double pdh = iHigh(_Symbol, PERIOD_D1, 1);
+   double pdl = iLow (_Symbol, PERIOD_D1, 1);
+   string loc = "mid";
+   if(pdh > pdl)
+   {
+      double frac = (entry - pdl)/(pdh - pdl);
+      if(frac >= 0.66)      loc = "premium";
+      else if(frac <= 0.33) loc = "discount";
+      double atrN = GetATR(1);
+      if(atrN>0 && MathAbs(entry-pdh) <= 0.25*atrN) loc = "atPDH";
+      if(atrN>0 && MathAbs(entry-pdl) <= 0.25*atrN) loc = "atPDL";
+   }
+   MqlDateTime g; TimeGMT(g);
+   int cur=(g.hour+InpTargetGMT)*60+g.min; if(cur<0)cur+=1440; if(cur>=1440)cur-=1440;
+   int htf = HTFTrend();
+   string vol = IsHighVol() ? "high" : "norm";
+   string raid = g_raidedLow&&!g_raidedHigh ? "lowRaid" : (g_raidedHigh&&!g_raidedLow ? "highRaid" : "noRaid");
+
+   int idx = g_auditCount++;
+   g_audit[idx].used=true; g_audit[idx].ticket=ticket; g_audit[idx].dir=dir;
+   g_audit[idx].entry=entry; g_audit[idx].isl=sl;
+   g_audit[idx].riskdist=MathAbs(entry-sl);
+   g_audit[idx].mfePrice=entry; g_audit[idx].maePrice=entry; g_audit[idx].lastPrice=entry;
+   g_audit[idx].openTime=TimeCurrent(); g_audit[idx].sig=comment;
+   g_audit[idx].ctx=StringFormat("sig=%s dir=%s loc=%s pdh=%.2f pdl=%.2f htf=%d vol=%s sess=%s raid=%s atr=%.2f",
+        comment, (dir>0?"L":"S"), loc, pdh, pdl, htf, vol, SessionName(cur), raid, GetATR(1));
+   if(InpAuditLog)
+      Print("SYM AUDIT ENTRY #",ticket," entry=",DoubleToString(entry,2),
+            " sl=",DoubleToString(sl,2)," ",g_audit[idx].ctx);
+}
+
+void AuditSync()
+{
+   // 1) update / register from current open positions
+   bool stillOpen[256];
+   for(int i=0;i<g_auditCount;i++) stillOpen[i]=false;
+
+   int total = PositionsTotal();
+   for(int p=0;p<total;p++)
+   {
+      ulong tk = PositionGetTicket(p);
+      if(!PositionSelectByTicket(tk)) continue;
+      if(PositionGetString(POSITION_SYMBOL)!=_Symbol) continue;
+      if(PositionGetInteger(POSITION_MAGIC)!=InpMagic) continue;
+      long type = PositionGetInteger(POSITION_TYPE);
+      int dir = (type==POSITION_TYPE_BUY)?1:-1;
+      double entry = PositionGetDouble(POSITION_PRICE_OPEN);
+      double sl    = PositionGetDouble(POSITION_SL);
+      string cmt   = PositionGetString(POSITION_COMMENT);
+      int idx = AuditFind((long)tk);
+      if(idx<0)
+      {
+         AuditRegister((long)tk, dir, entry, (sl>0?sl:entry-dir*GetATR(1)), cmt);
+         idx = AuditFind((long)tk);
+      }
+      if(idx>=0)
+      {
+         stillOpen[idx]=true;
+         double hi=High[1], lo=Low[1];
+         // favorable = direction of trade; adverse = opposite
+         if(dir>0){ if(hi>g_audit[idx].mfePrice)g_audit[idx].mfePrice=hi; if(lo<g_audit[idx].maePrice)g_audit[idx].maePrice=lo; }
+         else     { if(lo<g_audit[idx].mfePrice)g_audit[idx].mfePrice=lo; if(hi>g_audit[idx].maePrice)g_audit[idx].maePrice=hi; }
+         g_audit[idx].lastPrice = Close[1];
+      }
+   }
+
+   // 2) any tracked ticket no longer open -> closed: log EXIT, free slot
+   for(int i=0;i<g_auditCount;i++)
+   {
+      if(!g_audit[i].used || stillOpen[i]) continue;
+      double rd=g_audit[i].riskdist; if(rd<=0) rd=1e-9;
+      double mfeR=(g_audit[i].mfePrice-g_audit[i].entry)*g_audit[i].dir/rd;
+      double maeR=(g_audit[i].maePrice-g_audit[i].entry)*g_audit[i].dir/rd;
+      double exitR=(g_audit[i].lastPrice-g_audit[i].entry)*g_audit[i].dir/rd;
+      if(InpAuditLog)
+         Print("SYM AUDIT EXIT #",g_audit[i].ticket," ",g_audit[i].sig,
+               " mfeR=",DoubleToString(mfeR,2)," maeR=",DoubleToString(maeR,2),
+               " exitR=",DoubleToString(exitR,2),
+               " capturePct=",DoubleToString(mfeR>0?100*exitR/mfeR:0,0));
+      g_audit[i].used=false;
+   }
+   // 3) compact array if many freed
+   int w=0;
+   for(int i=0;i<g_auditCount;i++) if(g_audit[i].used){ if(w!=i) g_audit[w]=g_audit[i]; w++; }
+   g_auditCount=w;
+}
+
 
 //==================================================================
 // 14. EQUITY KILL SWITCH - REMOVED
@@ -1441,6 +1588,10 @@ int OnInit()
    g_asiaHigh = 0.0; g_asiaLow = 0.0; g_asiaDay = -1;
    g_asiaComplete = false; g_raidedHigh = false; g_raidedLow = false;
 
+   // R-9 audit instrumentation
+   g_auditCount = 0;
+   for(int i=0;i<256;i++) g_audit[i].used = false;
+
    if(!RefreshSeries()) return INIT_FAILED;
 
    Print("SYMPHONY v3.0 loaded.");
@@ -1479,5 +1630,8 @@ void OnTick()
 
    // 6. Open new Phase 3 / Phase 4 entries (time-gated, basket-ceiling checked)
    ExecuteTrading();
+
+   // 7. R-9 audit instrumentation: register entries, track MFE/MAE, log exits
+   AuditSync();
 }
 //+------------------------------------------------------------------+
