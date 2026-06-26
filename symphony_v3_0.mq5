@@ -897,7 +897,11 @@ void RunProfitLadderDirection(int direction, int &rungs)
       double pnl   = PositionGetDouble(POSITION_PROFIT)
                    + PositionGetDouble(POSITION_SWAP)
                    + PositionGetDouble(POSITION_COMMISSION);
-      double distSL = (sl > 0.0) ? MathAbs(entry - sl) : (2.0 * atrFB);
+      double distSL = (sl > 0.0) ? MathAbs(entry - sl) : 0.0;
+      // Once SL is at or past breakeven, distSL collapses to 0 which kills
+      // the ratio denominator (totalRisk=0 → guard exits → Rungs 2/3 never fire).
+      // Fix: use 1 ATR as a structural floor whenever the real distance is tiny.
+      if(distSL < 1.0) distSL = atrFB;
 
       totalLots += lots;
       totalRisk += lots * distSL * 100.0;
