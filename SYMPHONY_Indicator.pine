@@ -5,25 +5,14 @@
 // Faithful conversion of:
 //   SYMPHONY_Physics_Engine_Elite_Max_Phase34_DRDWCT_v1_6.mq5
 //
-// Ported to Pine Script:
-//   - Pivot detection (PivotLen each side)
-//   - Impulse detection (ATR-scaled high->low / low->high)
-//   - Anchor high/low + inducement (flipzone) detection
-//   - Phase engine (phases 1..4) for long & short
-//   - ARC v2 convexity target
-//   - Phase 3 / Phase 4 entry signals (session time-gated)
-//   - Structural stop-loss levels
-//   - ARC + institutional sweep + phase-end composite EXIT signals
-//   - Alerts for entries & exits
+// Adds rich on-chart entry/exit labels, a Dashboard panel and a
+// Co-Pilot advisory panel.
 //
 // NOT ported (impossible in an indicator - no broker positions/equity):
 //   - DRDWCT VaR risk engine (position trimming / lot sizing / VaR limits)
-//   These manage live open positions and have no meaning on a chart study.
 //
-// NOTE ON ARC: in the original EA the arc "time" factor is frozen at
-// impulse-detection (bar shift never updates), so the arc resolves to a
-// fixed price level per impulse. This conversion replicates that exact
-// behaviour (a horizontal projected target per impulse).
+// ARC note: the EA freezes the arc "time" factor at impulse detection,
+// so the arc resolves to a fixed projected target per impulse. Replicated.
 // =====================================================================
 
 indicator("SYMPHONY Phase 3/4 + ARC v2", overlay=true, max_lines_count=500, max_labels_count=500, max_boxes_count=500)
@@ -48,23 +37,25 @@ arcExtMult = input.float(1.5,"Arc extension (imp mult)", minval=0.1, step=0.1, g
 outerBandAtrMult = input.float(0.75,"Outer band distance (ATR)", minval=0.0, step=0.05, group="Exits")
 arcToleranceAtr  = input.float(0.20,"ARC exhaust tolerance (ATR)",minval=0.0, step=0.05, group="Exits")
 
-// INPUTS - TIMING (GMT baseline, mirrors EA London/US sessions)
+// INPUTS - TIMING (GMT baseline)
 useTimeFilter = input.bool(true, "Use session time filter", group="Timing")
 targetGMT     = input.int(0,     "Target session GMT offset", group="Timing")
 
 // INPUTS - DISPLAY
-showAnchors = input.bool(true,  "Show anchor high/low",  group="Display")
-showZones   = input.bool(true,  "Show inducement zones", group="Display")
-showArc     = input.bool(true,  "Show ARC target",       group="Display")
-showSL      = input.bool(false, "Show stop-loss levels", group="Display")
-showTable   = input.bool(true,  "Show status table",     group="Display")
-shadeSess   = input.bool(false, "Shade trade sessions",  group="Display")
+showLabels   = input.bool(true,  "Detailed entry/exit labels", group="Display")
+showAnchors  = input.bool(true,  "Show anchor high/low",       group="Display")
+showZones    = input.bool(true,  "Show inducement zones",      group="Display")
+showArc      = input.bool(true,  "Show ARC target",            group="Display")
+showSL       = input.bool(true,  "Show stop-loss levels",      group="Display")
+shadeSess    = input.bool(false, "Shade trade sessions",       group="Display")
+showDash     = input.bool(true,  "Show Dashboard panel",       group="Panels")
+showCopilot  = input.bool(true,  "Show Co-Pilot panel",        group="Panels")
+dashPos      = input.string("Top Right",   "Dashboard position", options=["Top Right","Top Left","Bottom Right","Bottom Left","Middle Right"], group="Panels")
+copilotPos   = input.string("Bottom Right","Co-Pilot position",  options=["Top Right","Top Left","Bottom Right","Bottom Left","Middle Right"], group="Panels")
 
 // ---------------------------------------------------------------------
 // HELPERS
 // ---------------------------------------------------------------------
-// Strict pivot high: high[c] greater than all neighbours within pivotLen.
-// (EA: IsPivotHigh, center = pivotLen + 1)
 isPivotHigh(int c) =>
     float h = high[c]
     bool res = not na(h)
@@ -85,7 +76,6 @@ isPivotLow(int c) =>
                 break
     res
 
-// Session filter (EA IsTradeTime, GMT baseline + offset)
 isTradeTime() =>
     int h = hour(time, "GMT") + targetGMT
     int m = minute(time, "GMT")
@@ -94,62 +84,63 @@ isTradeTime() =>
     if h >= 24
         h -= 24
     int curMin = h * 60 + m
-    bool w1 = curMin >= 480 and curMin <= 705   // London AM 08:00-11:45
-    bool w2 = curMin >= 705 and curMin <= 735   // UK micro 11:45-12:15
-    bool w3 = curMin >= 795 and curMin <= 825   // 13:15-13:45
-    bool w4 = curMin >= 870 and curMin <= 1080  // US 14:30-18:00
-    bool k1 = curMin >= 480 and curMin <= 540   // early London 08:00-09:00
-    bool k2 = curMin >= 495 and curMin <= 525   // 08:30 +/-15
-    bool k3 = curMin >= 885 and curMin <= 915   // 15:00 +/-15
-    bool k4 = curMin >= 1005 and curMin <= 1035 // 17:00 +/-15
+    bool w1 = curMin >= 480 and curMin <= 705
+    bool w2 = curMin >= 705 and curMin <= 735
+    bool w3 = curMin >= 795 and curMin <= 825
+    bool w4 = curMin >= 870 and curMin <= 1080
+    bool k1 = curMin >= 480 and curMin <= 540
+    bool k2 = curMin >= 495 and curMin <= 525
+    bool k3 = curMin >= 885 and curMin <= 915
+    bool k4 = curMin >= 1005 and curMin <= 1035
     w1 or w2 or w3 or w4 or k1 or k2 or k3 or k4
 
+phaseName(int p) =>
+    p == 4 ? "Extreme / Breakout" : p == 3 ? "Pre-convexity (arming)" : p == 2 ? "Retrace / maturing" : p == 1 ? "Impulse build-up" : "Inactive"
+
+posFromStr(string s) =>
+    s == "Top Right" ? position.top_right : s == "Top Left" ? position.top_left : s == "Bottom Right" ? position.bottom_right : s == "Bottom Left" ? position.bottom_left : position.middle_right
+
 // ---------------------------------------------------------------------
-// STATE (var = persists across bars, mirrors EA globals)
+// STATE
 // ---------------------------------------------------------------------
-var int   mode             = 0          // -1 short, 1 long, 0 none
+var int   mode             = 0
 var float anchorHigh        = na
 var float anchorLow         = na
 var int   anchorHighBar      = na
 var int   anchorLowBar       = na
-
 var float lastPivotPrice     = na
 var int   lastPivotBar        = na
 var int   lastPivotDir        = 0
-
 var int   phaseShort         = 0
 var int   phaseLong          = 0
 var int   prevPhaseShort     = 0
 var int   prevPhaseLong      = 0
-
 var float shortInducPrice    = na
 var float shortInducLow      = na
 var float shortInducHigh     = na
 var float longInducPrice     = na
 var float longInducLow       = na
 var float longInducHigh      = na
-
 var bool  shortPreConvSeen   = false
 var bool  longPreConvSeen    = false
-
 var float arcLong            = na
 var float arcShort           = na
-
 var bool  longOuterBreachSeen  = false
 var bool  shortOuterBreachSeen = false
+var string lastSignalTxt     = "—"
+var int    lastSignalBar      = na
 
 // ---------------------------------------------------------------------
 // PER-BAR INPUTS (EA operates on last closed bar => shift 1)
 // ---------------------------------------------------------------------
 int   center = pivotLen + 1
-float atrCur = ta.atr(atrLen)[1]   // EA GetATR(1)
-float cNow   = close[1]            // EA Close[shiftNow], shiftNow = 1
+float atrCur = ta.atr(atrLen)[1]
+float cNow   = close[1]
 bool  enoughBars = bar_index > (2 * pivotLen + 6)
 
 // =====================================================================
 // 1. PHASE ENGINE - IMPULSE + PHASES
 // =====================================================================
-// --- pivot at center bar ---
 float pPrice = na
 int   pDir   = 0
 if enoughBars
@@ -161,9 +152,7 @@ if enoughBars
         pPrice := low[center]
 int pBar = bar_index - center
 
-// --- impulse detection (must run BEFORE persisting pivot history) ---
 if enoughBars and pDir == -1 and lastPivotDir == 1
-    // SHORT impulse: last high -> new low
     float r = lastPivotPrice - pPrice
     if r > atrCur * impulseAtrMult
         mode           := -1
@@ -183,7 +172,6 @@ if enoughBars and pDir == -1 and lastPivotDir == 1
         longInducHigh   := na
         longOuterBreachSeen  := false
         shortOuterBreachSeen := false
-        // inducement: nearest inside-bar forward from the anchor high
         float lvlS = na
         if not na(anchorHighBar)
             for b = anchorHighBar + 1 to bar_index
@@ -198,7 +186,6 @@ if enoughBars and pDir == -1 and lastPivotDir == 1
             shortInducLow   := lvlS - atrCur * inducZoneAtrWidth
             shortInducHigh  := lvlS + atrCur * inducZoneAtrWidth
 else if enoughBars and pDir == 1 and lastPivotDir == -1
-    // LONG impulse: last low -> new high
     float r = pPrice - lastPivotPrice
     if r > atrCur * impulseAtrMult
         mode           := 1
@@ -232,13 +219,11 @@ else if enoughBars and pDir == 1 and lastPivotDir == -1
             longInducLow   := lvlL - atrCur * inducZoneAtrWidth
             longInducHigh  := lvlL + atrCur * inducZoneAtrWidth
 
-// --- persist pivot history ---
 if pDir != 0
     lastPivotPrice := pPrice
     lastPivotBar    := pBar
     lastPivotDir    := pDir
 
-// --- impulse invalidation ---
 if mode == -1 and not na(anchorHigh) and cNow > anchorHigh
     mode            := 0
     phaseShort      := 0
@@ -260,11 +245,9 @@ if mode == 1 and not na(anchorLow) and cNow < anchorLow
     longOuterBreachSeen  := false
     shortOuterBreachSeen := false
 
-// --- phase computation ---
 int oldPhaseShort = phaseShort
 int oldPhaseLong  = phaseLong
 
-// SHORT side
 if mode != -1
     phaseShort := 0
 if mode == -1 and not na(anchorHighBar) and not na(anchorLowBar)
@@ -289,7 +272,6 @@ if mode == -1 and not na(anchorHighBar) and not na(anchorLowBar)
         phaseTmpS := 2
     phaseShort := phaseTmpS
 
-// LONG side
 if mode != 1
     phaseLong := 0
 if mode == 1 and not na(anchorHighBar) and not na(anchorLowBar)
@@ -318,11 +300,11 @@ prevPhaseShort := oldPhaseShort
 prevPhaseLong  := oldPhaseLong
 
 // =====================================================================
-// 2. ARC v2 (convexity target) - frozen-time per impulse (matches EA)
+// 2. ARC v2 (frozen-time target per impulse)
 // =====================================================================
 arcLong  := na
 arcShort := na
-float tFactor = math.min(1.0, math.max(0.0, float(pivotLen) / arcHorizon)) // (pivotLen+1-1)/horizon
+float tFactor = math.min(1.0, math.max(0.0, float(pivotLen) / arcHorizon))
 if mode == 1 and not na(anchorLowBar) and not na(anchorHighBar)
     float impL = anchorHigh - anchorLow
     if impL > 0
@@ -335,27 +317,25 @@ if mode == -1 and not na(anchorLowBar) and not na(anchorHighBar)
         arcShort := anchorHigh + (targetS - anchorHigh) * math.pow(tFactor, convPower)
 
 // =====================================================================
-// 3. ENTRY SIGNALS - PHASE 3 & PHASE 4 ONLY (time-gated)
+// 3. ENTRY SIGNALS - PHASE 3 & PHASE 4 (time-gated)
 // =====================================================================
 bool tradeOk = (not useTimeFilter) or isTradeTime()
 float impLnow = (not na(anchorHigh) and not na(anchorLow)) ? anchorHigh - anchorLow : 0.0
-
 float slLong  = not na(anchorLow)  ? anchorLow  - atrCur * 0.25 : na
 float slShort = not na(anchorHigh) ? anchorHigh + atrCur * 0.25 : na
 
-bool longP3sig = tradeOk and mode == 1 and phaseLong == 3 and not na(slLong) and slLong > 0 and cNow > slLong
+bool longP3sig  = tradeOk and mode == 1 and phaseLong == 3 and not na(slLong) and slLong > 0 and cNow > slLong
 bool longP4cond = mode == 1 and phaseLong == 4 and impLnow > 0 and (cNow > anchorHigh or cNow > high[2] + 0.20 * atrCur)
-bool longP4sig = tradeOk and longP4cond and not na(slLong) and slLong > 0 and cNow > slLong
-
-bool shortP3sig = tradeOk and mode == -1 and phaseShort == 3 and not na(slShort) and slShort > 0 and slShort > cNow
+bool longP4sig  = tradeOk and longP4cond and not na(slLong) and slLong > 0 and cNow > slLong
+bool shortP3sig  = tradeOk and mode == -1 and phaseShort == 3 and not na(slShort) and slShort > 0 and slShort > cNow
 bool shortP4cond = mode == -1 and phaseShort == 4 and impLnow > 0 and (cNow < anchorLow or cNow < low[2] - 0.20 * atrCur)
-bool shortP4sig = tradeOk and shortP4cond and not na(slShort) and slShort > 0 and slShort > cNow
+bool shortP4sig  = tradeOk and shortP4cond and not na(slShort) and slShort > 0 and slShort > cNow
 
 bool longEntry  = longP3sig or longP4sig
 bool shortEntry = shortP3sig or shortP4sig
 
 // =====================================================================
-// 4. EXIT SIGNALS - ARC + INSTITUTIONAL SWEEP + PHASE END
+// 4. EXIT SIGNALS
 // =====================================================================
 bool arcExhaustLong  = mode == 1  and not na(arcLong)  and arcLong  > 0.0 and cNow >= (arcLong  - arcToleranceAtr * atrCur)
 bool arcExhaustShort = mode == -1 and not na(arcShort) and arcShort > 0.0 and cNow <= (arcShort + arcToleranceAtr * atrCur)
@@ -363,7 +343,6 @@ bool arcExhaustShort = mode == -1 and not na(arcShort) and arcShort > 0.0 and cN
 float instLevelL = not na(longInducPrice)  ? longInducPrice  : ((not na(anchorHigh) and anchorHigh > 0) ? anchorHigh : 0.0)
 float innerTopL  = not na(longInducHigh)   ? longInducHigh   : instLevelL
 float outerTopL  = innerTopL + outerBandAtrMult * atrCur
-
 float instLevelS = not na(shortInducPrice) ? shortInducPrice : ((not na(anchorLow) and anchorLow > 0) ? anchorLow : 0.0)
 float innerBotS  = not na(shortInducLow)   ? shortInducLow   : instLevelS
 float outerBotS  = innerBotS - outerBandAtrMult * atrCur
@@ -390,71 +369,166 @@ if mode == -1 and arcExhaustShort and phaseTrendEndShort
         exitShort := true
 
 // =====================================================================
-// 5. PLOTTING
+// 5. LEVEL PLOTS
 // =====================================================================
 bool inLong  = mode == 1
 bool inShort = mode == -1
 
-// Anchors
-plot(showAnchors and inLong  ? anchorHigh : na, "Anchor High (target)", color.new(color.red, 0),   2, plot.style_linebr)
-plot(showAnchors and inLong  ? anchorLow  : na, "Anchor Low (origin)",  color.new(color.green, 0), 2, plot.style_linebr)
-plot(showAnchors and inShort ? anchorHigh : na, "Anchor High (origin)", color.new(color.red, 0),   2, plot.style_linebr)
-plot(showAnchors and inShort ? anchorLow  : na, "Anchor Low (target)",  color.new(color.green, 0), 2, plot.style_linebr)
+plot(showAnchors and inLong  ? anchorHigh : na, "Anchor High (LONG target)", color.new(color.red, 0),   2, plot.style_linebr)
+plot(showAnchors and inLong  ? anchorLow  : na, "Anchor Low (LONG origin)",  color.new(color.green, 0), 2, plot.style_linebr)
+plot(showAnchors and inShort ? anchorHigh : na, "Anchor High (SHORT origin)",color.new(color.red, 0),   2, plot.style_linebr)
+plot(showAnchors and inShort ? anchorLow  : na, "Anchor Low (SHORT target)", color.new(color.green, 0), 2, plot.style_linebr)
 
-// Inducement / flipzone bands
 pLongIndH = plot(showZones and inLong  and not na(longInducHigh)  ? longInducHigh  : na, "Long Induc High",  color.new(color.teal, 60), 1, plot.style_linebr)
 pLongIndL = plot(showZones and inLong  and not na(longInducLow)   ? longInducLow   : na, "Long Induc Low",   color.new(color.teal, 60), 1, plot.style_linebr)
 fill(pLongIndH, pLongIndL, color.new(color.teal, 88), "Long Flipzone")
-
 pShortIndH = plot(showZones and inShort and not na(shortInducHigh) ? shortInducHigh : na, "Short Induc High", color.new(color.maroon, 60), 1, plot.style_linebr)
 pShortIndL = plot(showZones and inShort and not na(shortInducLow)  ? shortInducLow  : na, "Short Induc Low",  color.new(color.maroon, 60), 1, plot.style_linebr)
 fill(pShortIndH, pShortIndL, color.new(color.maroon, 88), "Short Flipzone")
 
-// ARC target
 plot(showArc and not na(arcLong)  ? arcLong  : na, "ARC Long Target",  color.new(color.orange, 0), 2, plot.style_linebr)
 plot(showArc and not na(arcShort) ? arcShort : na, "ARC Short Target", color.new(color.orange, 0), 2, plot.style_linebr)
+plot(showSL and inLong  ? slLong  : na, "SL Long",  color.new(color.gray, 0), 1, plot.style_circles)
+plot(showSL and inShort ? slShort : na, "SL Short", color.new(color.gray, 0), 1, plot.style_circles)
 
-// Stop-loss levels (optional)
-plot(showSL and inLong  ? slLong  : na, "SL Long",  color.new(color.gray, 0), 1, plot.style_linebr)
-plot(showSL and inShort ? slShort : na, "SL Short", color.new(color.gray, 0), 1, plot.style_linebr)
-
-// Session shading
-bgcolor(shadeSess and (not useTimeFilter or isTradeTime()) ? color.new(color.blue, 92) : na, title="Session")
-
-// Entry / exit markers
-plotshape(longP3sig,  "Long P3 Entry",  shape.triangleup,   location.belowbar, color.new(color.green, 0),  text="P3", textcolor=color.white, size=size.small)
-plotshape(longP4sig,  "Long P4 Entry",  shape.triangleup,   location.belowbar, color.new(color.lime, 0),   text="P4", textcolor=color.black, size=size.small)
-plotshape(shortP3sig, "Short P3 Entry", shape.triangledown, location.abovebar, color.new(color.red, 0),    text="P3", textcolor=color.white, size=size.small)
-plotshape(shortP4sig, "Short P4 Entry", shape.triangledown, location.abovebar, color.new(color.fuchsia,0), text="P4", textcolor=color.white, size=size.small)
-
-plotshape(exitLong,  "Exit Long",  shape.xcross, location.abovebar, color.new(color.orange, 0), text="EXIT", textcolor=color.orange, size=size.tiny)
-plotshape(exitShort, "Exit Short", shape.xcross, location.belowbar, color.new(color.orange, 0), text="EXIT", textcolor=color.orange, size=size.tiny)
+bgcolor(shadeSess and tradeOk ? color.new(color.blue, 92) : na, title="Session")
 
 // =====================================================================
-// 6. STATUS TABLE
+// 6. SIGNAL MARKERS + RICH LABELS
 // =====================================================================
-if showTable and barstate.islast
-    var table tbl = table.new(position.top_right, 2, 5, border_width=1)
-    string modeStr = mode == 1 ? "LONG" : mode == -1 ? "SHORT" : "FLAT"
-    color  modeCol = mode == 1 ? color.green : mode == -1 ? color.red : color.gray
-    table.cell(tbl, 0, 0, "SYMPHONY", text_color=color.white, bgcolor=color.new(color.blue, 0), text_size=size.small)
-    table.cell(tbl, 1, 0, modeStr, text_color=color.white, bgcolor=color.new(modeCol, 0), text_size=size.small)
-    table.cell(tbl, 0, 1, "Phase Long",  text_color=color.white, bgcolor=color.new(color.gray, 30), text_size=size.small)
-    table.cell(tbl, 1, 1, str.tostring(phaseLong),  text_color=color.white, bgcolor=color.new(color.gray, 50), text_size=size.small)
-    table.cell(tbl, 0, 2, "Phase Short", text_color=color.white, bgcolor=color.new(color.gray, 30), text_size=size.small)
-    table.cell(tbl, 1, 2, str.tostring(phaseShort), text_color=color.white, bgcolor=color.new(color.gray, 50), text_size=size.small)
-    table.cell(tbl, 0, 3, "ARC target", text_color=color.white, bgcolor=color.new(color.gray, 30), text_size=size.small)
-    float arcShow = not na(arcLong) ? arcLong : arcShort
-    table.cell(tbl, 1, 3, na(arcShow) ? "-" : str.tostring(arcShow, format.mintick), text_color=color.white, bgcolor=color.new(color.gray, 50), text_size=size.small)
-    table.cell(tbl, 0, 4, "Session", text_color=color.white, bgcolor=color.new(color.gray, 30), text_size=size.small)
-    table.cell(tbl, 1, 4, tradeOk ? "OPEN" : "CLOSED", text_color=color.white, bgcolor=color.new(tradeOk ? color.green : color.red, 30), text_size=size.small)
+// compact triangle markers (always on)
+plotshape(longP3sig,  "Long P3",  shape.triangleup,   location.belowbar, color.new(color.green, 0),  size=size.tiny)
+plotshape(longP4sig,  "Long P4",  shape.triangleup,   location.belowbar, color.new(color.lime, 0),   size=size.tiny)
+plotshape(shortP3sig, "Short P3", shape.triangledown, location.abovebar, color.new(color.red, 0),    size=size.tiny)
+plotshape(shortP4sig, "Short P4", shape.triangledown, location.abovebar, color.new(color.fuchsia,0), size=size.tiny)
+
+f_fmt(float p) => na(p) ? "n/a" : str.tostring(p, format.mintick)
+
+// LONG entry label
+if longEntry
+    string ph  = longP4sig ? "P4" : "P3"
+    string txt = "▲ BUY " + ph + "\nEntry " + f_fmt(cNow) + "\nSL " + f_fmt(slLong) + "\nTGT " + f_fmt(arcLong)
+    lastSignalTxt := "BUY " + ph + " @ " + f_fmt(cNow)
+    lastSignalBar  := bar_index
+    if showLabels
+        label.new(bar_index, low, txt, xloc.bar_index, yloc.belowbar, color.new(color.green, 0), label.style_label_up, color.white, size.normal)
+
+// SHORT entry label
+if shortEntry
+    string ph  = shortP4sig ? "P4" : "P3"
+    string txt = "▼ SELL " + ph + "\nEntry " + f_fmt(cNow) + "\nSL " + f_fmt(slShort) + "\nTGT " + f_fmt(arcShort)
+    lastSignalTxt := "SELL " + ph + " @ " + f_fmt(cNow)
+    lastSignalBar  := bar_index
+    if showLabels
+        label.new(bar_index, high, txt, xloc.bar_index, yloc.abovebar, color.new(color.red, 0), label.style_label_down, color.white, size.normal)
+
+// EXIT labels
+if exitLong
+    lastSignalTxt := "EXIT LONG @ " + f_fmt(cNow)
+    lastSignalBar  := bar_index
+    if showLabels
+        label.new(bar_index, high, "✕ EXIT LONG\n@ " + f_fmt(cNow) + "\nARC + sweep + phase-end", xloc.bar_index, yloc.abovebar, color.new(color.orange, 0), label.style_label_down, color.white, size.normal)
+    else
+        label.new(bar_index, high, "EXIT", xloc.bar_index, yloc.abovebar, color.new(color.orange, 0), label.style_xcross, color.white, size.small)
+if exitShort
+    lastSignalTxt := "EXIT SHORT @ " + f_fmt(cNow)
+    lastSignalBar  := bar_index
+    if showLabels
+        label.new(bar_index, low, "✕ EXIT SHORT\n@ " + f_fmt(cNow) + "\nARC + sweep + phase-end", xloc.bar_index, yloc.belowbar, color.new(color.orange, 0), label.style_label_up, color.white, size.normal)
+    else
+        label.new(bar_index, low, "EXIT", xloc.bar_index, yloc.belowbar, color.new(color.orange, 0), label.style_xcross, color.white, size.small)
 
 // =====================================================================
-// 7. ALERTS
+// 7. CO-PILOT REASONING
 // =====================================================================
-alertcondition(longEntry,  "SYMPHONY Long Entry",  "SYMPHONY: Long entry (Phase 3/4)")
-alertcondition(shortEntry, "SYMPHONY Short Entry", "SYMPHONY: Short entry (Phase 3/4)")
-alertcondition(exitLong,   "SYMPHONY Exit Long",   "SYMPHONY: Exit long (ARC/institutional/phase-end)")
-alertcondition(exitShort,  "SYMPHONY Exit Short",  "SYMPHONY: Exit short (ARC/institutional/phase-end)")
+int    activePhase = mode == 1 ? phaseLong : mode == -1 ? phaseShort : 0
+bool   arcHit      = arcExhaustLong or arcExhaustShort
+float  arcTarget   = not na(arcLong) ? arcLong : arcShort
+float  distToTgt   = na(arcTarget) ? na : math.abs(arcTarget - cNow)
+
+// setup confidence 0..100
+float conf = 0.0
+conf += mode != 0 ? 25.0 : 0.0
+conf += activePhase == 4 ? 30.0 : activePhase == 3 ? 25.0 : activePhase == 2 ? 10.0 : activePhase == 1 ? 5.0 : 0.0
+conf += tradeOk ? 20.0 : 0.0
+conf += ((mode == 1 and not na(longInducPrice)) or (mode == -1 and not na(shortInducPrice))) ? 10.0 : 0.0
+conf += (mode != 0 and not arcHit) ? 15.0 : 0.0
+conf := math.min(conf, 100.0)
+string confLbl = conf >= 75 ? "HIGH" : conf >= 50 ? "MEDIUM" : conf >= 25 ? "LOW" : "MINIMAL"
+
+string biasTxt = mode == 1 ? "LONG" : mode == -1 ? "SHORT" : "FLAT"
+color  biasCol = mode == 1 ? color.green : mode == -1 ? color.red : color.gray
+
+string readTxt = mode == 0 ? "No active impulse - price between curves, unstructured." : (mode == 1 ? "LONG impulse owns price. " : "SHORT impulse owns price. ") + phaseName(activePhase)
+
+string actionTxt = "STAND ASIDE"
+color  actionCol = color.gray
+if exitLong or exitShort
+    actionTxt := exitLong ? "CLOSE LONGS - target/exhaustion" : "CLOSE SHORTS - target/exhaustion"
+    actionCol := color.orange
+else if longEntry
+    actionTxt := "ENTER LONG NOW (" + (longP4sig ? "P4" : "P3") + ")"
+    actionCol := color.green
+else if shortEntry
+    actionTxt := "ENTER SHORT NOW (" + (shortP4sig ? "P4" : "P3") + ")"
+    actionCol := color.red
+else if mode == 1
+    actionTxt := phaseLong >= 3 ? (tradeOk ? "ARM LONG - await trigger" : "LONG READY - session closed") : phaseLong == 2 ? "WATCH LONG - retrace maturing" : "BUILDING LONG - wait"
+    actionCol := phaseLong >= 3 ? color.teal : color.new(color.green, 35)
+else if mode == -1
+    actionTxt := phaseShort >= 3 ? (tradeOk ? "ARM SHORT - await trigger" : "SHORT READY - session closed") : phaseShort == 2 ? "WATCH SHORT - retrace maturing" : "BUILDING SHORT - wait"
+    actionCol := phaseShort >= 3 ? color.maroon : color.new(color.red, 35)
+else
+    actionTxt := "STAND ASIDE - no structure"
+    actionCol := color.gray
+
+string noteTxt = "Session " + (tradeOk ? "OPEN" : "CLOSED") + (arcHit ? " | ARC target reached" : "") + ((mode == 1 and longOuterBreachSeen) or (mode == -1 and shortOuterBreachSeen) ? " | outer sweep done" : "")
+
+// =====================================================================
+// 8. DASHBOARD PANEL
+// =====================================================================
+if showDash and barstate.islast
+    var table dash = table.new(position.top_right, 2, 8, border_width=1, frame_color=color.new(color.gray, 50), frame_width=1)
+    table.set_position(dash, posFromStr(dashPos))
+    color hdr = color.new(color.blue, 0)
+    color k   = color.new(color.gray, 25)
+    color v   = color.new(color.gray, 55)
+    table.cell(dash, 0, 0, "SYMPHONY DASHBOARD", text_color=color.white, bgcolor=hdr, text_size=size.small)
+    table.cell(dash, 1, 0, biasTxt, text_color=color.white, bgcolor=color.new(biasCol, 0), text_size=size.small)
+    table.cell(dash, 0, 1, "Phase LONG",  text_color=color.white, bgcolor=k, text_size=size.small)
+    table.cell(dash, 1, 1, str.tostring(phaseLong) + "  " + phaseName(phaseLong),  text_color=color.white, bgcolor=v, text_size=size.small)
+    table.cell(dash, 0, 2, "Phase SHORT", text_color=color.white, bgcolor=k, text_size=size.small)
+    table.cell(dash, 1, 2, str.tostring(phaseShort) + "  " + phaseName(phaseShort), text_color=color.white, bgcolor=v, text_size=size.small)
+    table.cell(dash, 0, 3, "Anchor Hi/Lo", text_color=color.white, bgcolor=k, text_size=size.small)
+    table.cell(dash, 1, 3, f_fmt(anchorHigh) + " / " + f_fmt(anchorLow), text_color=color.white, bgcolor=v, text_size=size.small)
+    table.cell(dash, 0, 4, "ARC target", text_color=color.white, bgcolor=k, text_size=size.small)
+    table.cell(dash, 1, 4, f_fmt(arcTarget), text_color=color.white, bgcolor=v, text_size=size.small)
+    table.cell(dash, 0, 5, "Dist to TGT", text_color=color.white, bgcolor=k, text_size=size.small)
+    table.cell(dash, 1, 5, f_fmt(distToTgt), text_color=color.white, bgcolor=v, text_size=size.small)
+    table.cell(dash, 0, 6, "Session", text_color=color.white, bgcolor=k, text_size=size.small)
+    table.cell(dash, 1, 6, tradeOk ? "OPEN" : "CLOSED", text_color=color.white, bgcolor=color.new(tradeOk ? color.green : color.red, 25), text_size=size.small)
+    table.cell(dash, 0, 7, "Last signal", text_color=color.white, bgcolor=k, text_size=size.small)
+    table.cell(dash, 1, 7, lastSignalTxt, text_color=color.white, bgcolor=v, text_size=size.small)
+
+// =====================================================================
+// 9. CO-PILOT PANEL
+// =====================================================================
+if showCopilot and barstate.islast
+    var table cp = table.new(position.bottom_right, 1, 6, border_width=1, frame_color=color.new(color.purple, 30), frame_width=1)
+    table.set_position(cp, posFromStr(copilotPos))
+    table.cell(cp, 0, 0, "🧭 SYMPHONY CO-PILOT", text_color=color.white, bgcolor=color.new(color.purple, 0), text_size=size.small)
+    table.cell(cp, 0, 1, "Bias: " + biasTxt, text_color=color.white, bgcolor=color.new(biasCol, 20), text_size=size.small)
+    table.cell(cp, 0, 2, "Read: " + readTxt, text_color=color.white, bgcolor=color.new(color.gray, 35), text_size=size.small)
+    table.cell(cp, 0, 3, "Action: " + actionTxt, text_color=color.white, bgcolor=color.new(actionCol, 10), text_size=size.small)
+    table.cell(cp, 0, 4, "Confidence: " + str.tostring(math.round(conf)) + "%  (" + confLbl + ")", text_color=color.white, bgcolor=color.new(conf >= 75 ? color.green : conf >= 50 ? color.teal : conf >= 25 ? color.orange : color.gray, 25), text_size=size.small)
+    table.cell(cp, 0, 5, noteTxt, text_color=color.white, bgcolor=color.new(color.gray, 45), text_size=size.small)
+
+// =====================================================================
+// 10. ALERTS
+// =====================================================================
+alertcondition(longEntry,  "SYMPHONY Long Entry",  "SYMPHONY: LONG entry (Phase 3/4)")
+alertcondition(shortEntry, "SYMPHONY Short Entry", "SYMPHONY: SHORT entry (Phase 3/4)")
+alertcondition(exitLong,   "SYMPHONY Exit Long",   "SYMPHONY: EXIT long")
+alertcondition(exitShort,  "SYMPHONY Exit Short",  "SYMPHONY: EXIT short")
 alertcondition(longEntry or shortEntry, "SYMPHONY Any Entry", "SYMPHONY: New entry signal")
 alertcondition(exitLong or exitShort,    "SYMPHONY Any Exit",  "SYMPHONY: Exit signal")
