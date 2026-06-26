@@ -89,9 +89,9 @@ input int    InpMagic             = 240220; // EA magic number
 // Defaults set early (0.3x/0.75x/1.5x) so the first capture
 // fires well before the peak, not near it.
 //==================================================================
-input double InpLadderRung1       = 0.3;    // Rung 1 trigger (PnL >= 0.3x basket risk)
-input double InpLadderRung2       = 0.75;   // Rung 2 trigger
-input double InpLadderRung3       = 1.5;    // Rung 3 trigger
+input double InpLadderRung1       = 0.7;    // Rung 1 trigger (PnL >= 0.7x basket risk)
+input double InpLadderRung2       = 1.5;    // Rung 2 trigger
+input double InpLadderRung3       = 2.5;    // Rung 3 trigger
 input double InpLadderFrac1       = 0.20;   // Lot fraction to close at rung 1
 input double InpLadderFrac2       = 0.25;   // Lot fraction to close at rung 2
 input double InpLadderFrac3       = 0.25;   // Lot fraction to close at rung 3
