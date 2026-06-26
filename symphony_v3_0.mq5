@@ -102,13 +102,17 @@ input double InpTrailLockPct      = 50.0;   // % of price move to lock after run
 //==================================================================
 // 1F. TIMING
 //==================================================================
-input int    InpTargetGMT         = 0;      // Session GMT offset
+// All time windows below are in BROKER SERVER TIME (the same clock as the
+// backtest journal the audit was derived from). Leave InpTargetGMT=0 to use
+// server time as-is. Set it only to manually shift windows if you move the EA
+// to a broker with a different server offset (e.g. -1 if new server is GMT+2).
+input int    InpTargetGMT         = 0;      // Manual hour shift on server time (0 = none)
 // Seasonal month block. Backtest shows Jul/Aug (summer illiquidity) and
 // Dec (holiday gaps + low liquidity) are net-negative expectancy months.
 // Blocking them added +GBP ~28,000 over the 2023-24 run. Comma-free flags:
-input bool   InpBlockJul          = true;   // Block July entries
-input bool   InpBlockAug          = true;   // Block August entries
-input bool   InpBlockDec          = true;   // Block December entries
+input bool   InpBlockJul          = false;   // Block July entries
+input bool   InpBlockAug          = false;   // Block August entries
+input bool   InpBlockDec          = false;   // Block December entries
 
 //==================================================================
 // 1G. LONDON-OPEN ASIA-RAID BIAS + PRE-NY BLOCK
@@ -120,12 +124,12 @@ input bool   InpBlockDec          = true;   // Block December entries
 // both) swept, block London-open entries entirely.
 // Hour 14 (pre-NY lull, 26% WR, -5.1R) is blocked outright.
 //==================================================================
-input bool   InpAsiaRaidBias      = true;   // London-open Asia-raid directional gate
+input bool   InpAsiaRaidBias      = false;   // London-open Asia-raid directional gate
 input int    InpAsiaStartMin      = 0;      // Asia window start (GMT min, 00:00)
 input int    InpAsiaEndMin        = 420;    // Asia window end   (GMT min, 07:00)
 input int    InpLondonOpenStart   = 480;    // London-open gate start (08:00)
 input int    InpLondonOpenEnd     = 660;    // London-open gate end   (11:00)
-input bool   InpBlockPreNY        = true;   // Block 14:00-14:55 pre-NY lull
+input bool   InpBlockPreNY        = false;   // Block 14:00-14:55 pre-NY lull
 input int    InpPreNYStart        = 840;    // 14:00
 input int    InpPreNYEnd          = 895;    // 14:55
 
@@ -136,7 +140,7 @@ input int    InpPreNYEnd          = 895;    // 14:55
 // (price below the HTF EMA). Longs are unaffected (they profit in
 // both trend states in this instrument).
 //==================================================================
-input bool            InpHTFShortGate  = true;        // Gate shorts by HTF trend
+input bool            InpHTFShortGate  = false;        // Gate shorts by HTF trend
 input ENUM_TIMEFRAMES InpHTFTimeframe  = PERIOD_D1;   // Higher timeframe
 input int             InpHTFEMAPeriod  = 50;          // HTF EMA period
 
@@ -146,7 +150,7 @@ input int             InpHTFEMAPeriod  = 50;          // HTF EMA period
 // Suppress ALL new entries when current ATR ranks in the top
 // InpVolBlockPctile of its recent distribution (expansion/whipsaw).
 //==================================================================
-input bool   InpVolFilter         = true;   // Suppress entries in high-ATR state
+input bool   InpVolFilter         = false;   // Suppress entries in high-ATR state
 input int    InpVolLookback        = 100;    // Bars for ATR percentile ranking
 input double InpVolBlockPctile     = 0.66;   // Block if ATR rank >= this percentile
 
@@ -443,7 +447,7 @@ double AdjustLotsForBasketCeiling(int direction, double entry, double sl, double
 bool IsTradeTime()
 {
    MqlDateTime g;
-   TimeGMT(g);
+   TimeToStruct(TimeCurrent(), g); // server time (matches journal/audit)
 
    // Seasonal month block: skip net-negative-expectancy months.
    // Jul/Aug = summer illiquidity; Dec = holiday gaps + thin liquidity.
@@ -1086,7 +1090,7 @@ void RunProfitLadder()
 void UpdateAsiaRange()
 {
    MqlDateTime g;
-   TimeGMT(g);
+   TimeToStruct(TimeCurrent(), g); // server time (matches journal/audit)
    int cur = (g.hour + InpTargetGMT) * 60 + g.min;
    if(cur < 0)    cur += 1440;
    if(cur >= 1440) cur -= 1440;
@@ -1132,7 +1136,7 @@ int LondonOpenBias()
 {
    if(!InpAsiaRaidBias) return 99;
    MqlDateTime g;
-   TimeGMT(g);
+   TimeToStruct(TimeCurrent(), g); // server time (matches journal/audit)
    int cur = (g.hour + InpTargetGMT) * 60 + g.min;
    if(cur < 0)    cur += 1440;
    if(cur >= 1440) cur -= 1440;
@@ -1234,7 +1238,7 @@ void AuditRegister(long ticket, int dir, double entry, double sl, string comment
       if(atrN>0 && MathAbs(entry-pdh) <= 0.25*atrN) loc = "atPDH";
       if(atrN>0 && MathAbs(entry-pdl) <= 0.25*atrN) loc = "atPDL";
    }
-   MqlDateTime g; TimeGMT(g);
+   MqlDateTime g; TimeToStruct(TimeCurrent(), g); // server time (matches journal/audit)
    int cur=(g.hour+InpTargetGMT)*60+g.min; if(cur<0)cur+=1440; if(cur>=1440)cur-=1440;
    int htf = HTFTrend();
    string vol = IsHighVol() ? "high" : "norm";
