@@ -102,11 +102,13 @@ input double InpTrailLockPct      = 50.0;   // % of price move to lock after run
 //==================================================================
 // 1F. TIMING
 //==================================================================
-// All time windows below are in BROKER SERVER TIME (the same clock as the
-// backtest journal the audit was derived from). Leave InpTargetGMT=0 to use
-// server time as-is. Set it only to manually shift windows if you move the EA
-// to a broker with a different server offset (e.g. -1 if new server is GMT+2).
-input int    InpTargetGMT         = 0;      // Manual hour shift on server time (0 = none)
+// Core session windows use GMT (TimeGMT) - same reference as the original
+// profitable baseline. InpTargetGMT shifts ALL windows if your broker needs it.
+// NOTE: the forensic audit's hour labels were in SERVER time (GMT+2/+3). The
+// pre-NY block window below is in GMT; if you want it to hit the audited
+// server-time hour 14, set InpPreNYStart/End to your server offset (e.g. for
+// GMT+3 server, server-14:00 = GMT 11:00 = 660).
+input int    InpTargetGMT         = 0;      // GMT session offset (shifts all windows)
 // Seasonal month block. Backtest shows Jul/Aug (summer illiquidity) and
 // Dec (holiday gaps + low liquidity) are net-negative expectancy months.
 // Blocking them added +GBP ~28,000 over the 2023-24 run. Comma-free flags:
@@ -117,11 +119,11 @@ input bool   InpBlockDec          = true;   // Block December entries
 //==================================================================
 // 1G. PRE-NY LULL BLOCK
 // Audit: hour 14 (pre-NY lull) = 26% WR, -5.1R, dominated by false
-// breakouts in thin liquidity. Block 14:00-14:55 (server time).
+// breakouts in thin liquidity. Window is in GMT (see note above).
 //==================================================================
-input bool   InpBlockPreNY        = true;   // Block 14:00-14:55 pre-NY lull (server)
-input int    InpPreNYStart        = 840;    // 14:00 server
-input int    InpPreNYEnd          = 895;    // 14:55 server
+input bool   InpBlockPreNY        = true;   // Block pre-NY lull window
+input int    InpPreNYStart        = 840;    // window start (GMT min; 840=14:00 GMT)
+input int    InpPreNYEnd          = 895;    // window end   (GMT min; 895=14:55 GMT)
 
 //==================================================================
 // 1H. HIGHER-TF TREND (audit classification only)
@@ -421,7 +423,7 @@ double AdjustLotsForBasketCeiling(int direction, double entry, double sl, double
 bool IsTradeTime()
 {
    MqlDateTime g;
-   TimeToStruct(TimeCurrent(), g); // server time (matches journal/audit)
+   TimeGMT(g);
 
    // Seasonal month block: skip net-negative-expectancy months.
    // Jul/Aug = summer illiquidity; Dec = holiday gaps + thin liquidity.
@@ -1144,7 +1146,7 @@ void AuditRegister(long ticket, int dir, double entry, double sl, string comment
       if(atrN>0 && MathAbs(entry-pdh) <= 0.25*atrN) loc = "atPDH";
       if(atrN>0 && MathAbs(entry-pdl) <= 0.25*atrN) loc = "atPDL";
    }
-   MqlDateTime g; TimeToStruct(TimeCurrent(), g); // server time (matches journal/audit)
+   MqlDateTime g; TimeGMT(g); // audit timestamp context
    int cur=(g.hour+InpTargetGMT)*60+g.min; if(cur<0)cur+=1440; if(cur>=1440)cur-=1440;
    int htf = HTFTrend();
    string vol = IsHighVol() ? "high" : "norm";
