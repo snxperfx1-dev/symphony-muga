@@ -1,8 +1,9 @@
 //+------------------------------------------------------------------+
-//| SYMPHONY_Physics_Engine_Elite_Max_Phase34_DRDWCT_v1_6.mq5       |
-//| Phase Engine (curvature-based) + DRDWCT v1.6 Risk Engine        |
+//| SYMPHONY_Physics_Engine_Elite_Max_Phase34_v2_2.mq5              |
+//| Phase Engine (curvature-based)                                  |
+//| Exits: ARC + institutional + peak-giveback ratchet +            |
+//|        R-tiered partials at 2R / 3.5R / 6R                     |
 //| Entries: Phase 3 + Phase 4 only (long & short)                  |
-//| TP: ARC + institutional sweep + phase-change composite exit     |
 //| MT5 HEDGING VERSION - RAW MqlTradeRequest (IOC)                 |
 //+------------------------------------------------------------------+
 #property strict
@@ -76,11 +77,34 @@ input double InpRiskPercent       = 0.5;    // Risk % per trade
 input int    InpMagic             = 240220; // EA magic number
 
 // Risk engine toggles
-input bool   InpEnableRiskEngine  = true;   // Enable DRDWCT risk engine
-input bool   InpBlockNewIfBreach  = true;   // Block new entries if VaR breached
 
 // Timing - target session timezone (GMT baseline)
 input int    InpTargetGMT         = 0;      // Target session timezone (GMT offset)
+
+//==================================================================
+// 2C. PROFIT PROTECTION
+//==================================================================
+input bool   InpUseTrailing       = true;   // Enable breakeven + trailing stop
+input double InpBETriggerAtr      = 1.0;    // Move SL to breakeven after this ATR move in favour
+input double InpBELockAtr         = 0.10;   // Breakeven buffer beyond entry (ATR)
+
+// Peak-giveback ratchet: SL locks a % of the BEST price ever seen so a
+// +$3k position cannot collapse to +$300 on a pop-and-reverse.
+input bool   InpUseGivebackTrail  = true;   // Lock % of peak profit (ratchets up, never loosens)
+input double InpGivebackTrigAtr   = 0.8;    // ATR favorable before ratchet engages
+input double InpGivebackLock      = 0.55;   // Normal legs: fraction of peak profit locked
+input double InpGivebackLockTop   = 0.78;   // Top-2 most-profitable legs: lock this fraction
+input int    InpAggTrailTopN      = 2;      // How many top-profit legs get the tighter lock
+
+// R-multiple tiered partials: scale out at profit milestones.
+// R-multiples scale correctly with position risk regardless of lot size.
+input bool   InpUseTieredPartials = true;   // Enable tiered partial exits
+input double InpPartial1R         = 2.0;    // First partial at 2R
+input double InpPartial1Pct       = 0.25;   // Close 25% of remaining lots at tier 1
+input double InpPartial2R         = 3.5;    // Second partial at 3.5R
+input double InpPartial2Pct       = 0.25;   // Close 25% at tier 2
+input double InpPartial3R         = 6.0;    // Third partial at 6R
+input double InpPartial3Pct       = 0.40;   // Close 40% at tier 3
 
 //==================================================================
 // 3. GLOBAL STATE - PHASE ENGINE
@@ -134,126 +158,6 @@ datetime g_lastLongTradeTime  = 0;
 datetime g_lastShortTradeTime = 0;
 
 //==================================================================
-// 4. DRDWCT STRUCTS
-//==================================================================
-enum RE_RiskProfile { RE_PROFILE_AGGRESSIVE = 0 };
-enum RE_RiskMode    { RE_MODE_INTRADAY = 0, RE_MODE_OVERNIGHT = 1 };
-
-struct RE_Position
-{
-   long   ticket;
-   double lots;
-   double entry;
-   double sl;
-   int    direction; // 1 long, -1 short
-   double pnl;
-};
-
-struct RE_Market
-{
-   double spot;
-   double atr15;
-   double atr30;
-   double equity;
-   double marginUsed;
-};
-
-struct RE_Metrics
-{
-   long   ticket;
-   double lots;
-   int    direction;
-   double entry;
-   double sl;
-   double distSL;
-   double riskToSL;
-   double rd;
-   double sag;
-   double gammaRaw;
-   double gammaVolScaled;
-   double liqProx;
-   double dVar2;
-   double uds;
-};
-
-struct RE_VarResult
-{
-   double var2;
-   double var3;
-};
-
-struct RE_Trim
-{
-   long   ticket;
-   double closeLots;
-};
-
-struct RE_BottomLayer
-{
-   double pCore;
-   int    status; // 0 = sacrificial, 1 = core
-};
-
-struct RE_Config
-{
-   RE_RiskProfile profile;
-   double rdLimit;
-
-   double w_rd;
-   double w_dVar2;
-   double w_gamma;
-   double w_liq;
-   double w_sag;
-
-   double udsDangerThreshold;
-
-   double partialCloseFraction;
-   double minLotsForPartial;
-
-   double highLayerQuantile;
-   double logisticK;
-   double logisticPivot;
-   double coreLowerBand;
-   double coreUpperBand;
-
-   double volSpikeMultiplier;
-   double volSpikeThreshold;
-
-   double liquidityLevels[32];
-   int    liqCount;
-};
-
-struct RE_ModelState
-{
-   bool   hasWeights;
-   double w_rd;
-   double w_dVar2;
-   double w_gamma;
-   double w_liq;
-   double w_sag;
-};
-
-struct RE_RiskResult
-{
-   RE_Position  positions[64];
-   int          posCount;
-   RE_Metrics   metrics[64];
-   int          metCount;
-   RE_VarResult varRes;
-   RE_BottomLayer bottom;
-   RE_Trim      trims[64];
-   int          trimCount;
-   double       udsMax;
-   bool         anyBomb;
-};
-
-// Global risk engine config/state
-RE_Config      g_reConfig;
-RE_ModelState  g_reModelState;
-RE_BottomLayer g_reBottom;
-bool           g_reBottomInit = false;
-bool           g_lastRiskOk   = true;
-
 //==================================================================
 // 5. BASIC HELPERS
 //==================================================================
@@ -714,722 +618,7 @@ void UpdateARC()
    }
 }
 
-//==================================================================
-// 7. DRDWCT CORE MATH (lot value, RD, SAG, gamma, liq, VaR)
-//==================================================================
-double RE_LotValue(double lots) { return(lots * 100.0); } // contract size 100, consistent with XAUUSD model
-
-double RE_StructuralSL(int direction, double spot)
 {
-   return(direction < 0 ? spot + 10.0 : spot - 10.0);
-}
-
-double RE_DistSL(double entry, double sl) { return(MathAbs(sl - entry)); }
-
-double RE_RiskToSL(double lots, double distSL)
-{
-   return(distSL * RE_LotValue(lots));
-}
-
-double RE_RD(double lots, double distSL)
-{
-   if(distSL == 0) return(1e10);
-   return(lots / distSL);
-}
-
-double RE_SAG(double lots, double distSL)
-{
-   if(distSL == 0) return(1e10);
-   return((lots * lots) / (distSL * distSL));
-}
-
-double RE_Gamma(double entry, double spot, double lots)
-{
-   double d = entry - spot;
-   return(d*d*lots);
-}
-
-double RE_GammaVolScaled(double gammaRaw, double atr15, double atr30)
-{
-   if(atr30 == 0) return(gammaRaw);
-   return(gammaRaw * (atr15/atr30));
-}
-
-double RE_LiqProx(double sl, RE_Config &cfg)
-{
-   if(cfg.liqCount <= 0) return(0);
-   double best = 1e10;
-   for(int i=0;i<cfg.liqCount;i++)
-   {
-      double d = MathAbs(cfg.liquidityLevels[i] - sl);
-      if(d < best) best = d;
-   }
-   return(1.0/(1.0+best));
-}
-
-//==================================================================
-// 8. VAR ENGINE
-//==================================================================
-void RE_BuildScenarios(RE_Market &m, RE_Config &cfg, double &scen[], int &scCount)
-{
-   double sigma = m.atr30;
-   double spot  = m.spot;
-
-   double tmp[64];
-   int count=0;
-
-   tmp[count++] = spot - 1*sigma;
-   tmp[count++] = spot - 2*sigma;
-   tmp[count++] = spot - 3*sigma;
-   tmp[count++] = spot + 1*sigma;
-   tmp[count++] = spot + 2*sigma;
-   tmp[count++] = spot + 3*sigma;
-
-   for(int i=0;i<cfg.liqCount && count<64;i++)
-      tmp[count++] = cfg.liquidityLevels[i];
-
-   scCount=0;
-   for(int i=0;i<count;i++)
-   {
-      bool exists=false;
-      for(int j=0;j<scCount;j++)
-      {
-         if(MathAbs(tmp[i]-scen[j])<1e-5){ exists=true; break;}
-      }
-      if(!exists){ scen[scCount]=tmp[i]; scCount++; }
-   }
-
-   for(int i=0;i<scCount-1;i++)
-      for(int j=i+1;j<scCount;j++)
-         if(scen[j]<scen[i])
-         { double t=scen[i]; scen[i]=scen[j]; scen[j]=t; }
-}
-
-double RE_ScenarioPnL(RE_Position &pos[], int posCount, double scenPrice)
-{
-   double tot=0;
-   for(int i=0;i<posCount;i++)
-   {
-      double move       = scenPrice - pos[i].entry;
-      double signedMove = (pos[i].direction<0 ? -move : move);
-      tot += signedMove * RE_LotValue(pos[i].lots);
-   }
-   return(tot);
-}
-
-void RE_ComputeVaR(RE_Position &pos[], int posCount, RE_Market &m, RE_Config &cfg, RE_VarResult &out)
-{
-   out.var2=0; out.var3=0;
-   if(posCount<=0) return;
-
-   double scen[64]; int scCount=0;
-   RE_BuildScenarios(m,cfg,scen,scCount);
-   if(scCount<=0) return;
-
-   double sigma = m.atr30;
-   double netLots=0;
-   for(int i=0;i<posCount;i++)
-   {
-      int sgn = (pos[i].direction<0 ? -1 : 1);
-      netLots += sgn * pos[i].lots;
-   }
-   double target2 = (netLots<0 ? m.spot+2*sigma : m.spot-2*sigma);
-
-   bool   worstInit=false, closestInit=false;
-   double worstPnl=0, closestPnl=0, closestDist=0;
-
-   for(int i=0;i<scCount;i++)
-   {
-      double price = scen[i];
-      double pnl   = RE_ScenarioPnL(pos,posCount,price);
-
-      if(!worstInit || pnl < worstPnl){ worstPnl=pnl; worstInit=true; }
-
-      double d = MathAbs(price-target2);
-      if(!closestInit || d<closestDist){ closestDist=d; closestPnl=pnl; closestInit=true; }
-   }
-
-   out.var3 = MathAbs(worstPnl);
-   out.var2 = MathAbs(closestPnl);
-}
-
-void RE_ComputeDeltaVar2(RE_Position &pos[], int posCount, RE_Market &m, RE_Config &cfg, double &out[])
-{
-   RE_VarResult full;
-   RE_ComputeVaR(pos,posCount,m,cfg,full);
-   double full2 = full.var2;
-
-   for(int i=0;i<posCount;i++)
-   {
-      RE_Position tmp[64];
-      int tCount=0;
-      for(int j=0;j<posCount;j++)
-      {
-         if(j==i) continue;
-         tmp[tCount]=pos[j];
-         tCount++;
-      }
-      RE_VarResult v;
-      RE_ComputeVaR(tmp,tCount,m,cfg,v);
-      out[i]=full2 - v.var2;
-   }
-}
-
-//==================================================================
-// 9. UDS & NORMALIZATION
-//==================================================================
-void RE_Normalize(double &src[], int n, double &dst[])
-{
-   if(n<=0) return;
-   double mn=src[0], mx=src[0];
-   for(int i=1;i<n;i++){ if(src[i]<mn) mn=src[i]; if(src[i]>mx) mx=src[i]; }
-   if(MathAbs(mx-mn)<1e-9){ for(int i=0;i<n;i++) dst[i]=0; return; }
-   for(int i=0;i<n;i++) dst[i]=(src[i]-mn)/(mx-mn);
-}
-
-int RE_BuildMetrics(RE_Position &pos[], int posCount, RE_Market &m, RE_Config &cfg, RE_ModelState &ms, RE_Metrics &met[])
-{
-   if(posCount<=0) return(0);
-
-   for(int i=0;i<posCount;i++)
-   {
-      RE_Metrics x;
-      x.ticket    = pos[i].ticket;
-      x.lots      = pos[i].lots;
-      x.direction = pos[i].direction;
-      x.entry     = pos[i].entry;
-
-      double sl = pos[i].sl;
-      if(sl==0) sl = RE_StructuralSL(x.direction, m.spot);
-      x.sl      = sl;
-      x.distSL  = RE_DistSL(x.entry, sl);
-      x.riskToSL= RE_RiskToSL(x.lots, x.distSL);
-      x.rd      = RE_RD(x.lots, x.distSL);
-      x.sag     = RE_SAG(x.lots, x.distSL);
-      x.gammaRaw= RE_Gamma(x.entry, m.spot, x.lots);
-      x.gammaVolScaled = RE_GammaVolScaled(x.gammaRaw, m.atr15, m.atr30);
-      x.liqProx = RE_LiqProx(sl, cfg);
-      x.dVar2   = 0;
-      x.uds     = 0;
-      met[i]=x;
-   }
-
-   double dVar2Arr[64];
-   RE_ComputeDeltaVar2(pos,posCount,m,cfg,dVar2Arr);
-   for(int i=0;i<posCount;i++) met[i].dVar2 = dVar2Arr[i];
-
-   double rd[64], d2[64], gV[64], liq[64], sag[64];
-   for(int i=0;i<posCount;i++)
-   {
-      rd[i] = met[i].rd;
-      d2[i] = met[i].dVar2;
-      gV[i] = met[i].gammaVolScaled;
-      liq[i]= met[i].liqProx;
-      sag[i]= met[i].sag;
-   }
-
-   double rdN[64], d2N[64], gVN[64], liqN[64], sagN[64];
-   RE_Normalize(rd,posCount,rdN);
-   RE_Normalize(d2,posCount,d2N);
-   RE_Normalize(gV,posCount,gVN);
-   RE_Normalize(liq,posCount,liqN);
-   RE_Normalize(sag,posCount,sagN);
-
-   double w_rd    = ms.hasWeights ? ms.w_rd    : cfg.w_rd;
-   double w_d2    = ms.hasWeights ? ms.w_dVar2 : cfg.w_dVar2;
-   double w_gamma = ms.hasWeights ? ms.w_gamma : cfg.w_gamma;
-   double w_liq   = ms.hasWeights ? ms.w_liq   : cfg.w_liq;
-   double w_sag   = ms.hasWeights ? ms.w_sag   : cfg.w_sag;
-
-   for(int i=0;i<posCount;i++)
-   {
-      double uds = w_rd*rdN[i] + w_d2*d2N[i] + w_gamma*gVN[i] + w_liq*liqN[i] + w_sag*sagN[i];
-      met[i].uds = uds;
-   }
-
-   if(m.atr30>0 && (m.atr15/m.atr30) > cfg.volSpikeThreshold)
-   {
-      for(int i=0;i<posCount;i++)
-      {
-         double v = met[i].uds * cfg.volSpikeMultiplier;
-         if(v>1) v=1;
-         met[i].uds = v;
-      }
-   }
-
-   return(posCount);
-}
-
-//==================================================================
-// 10. HIGH LAYER & BOTTOM LAYER
-//==================================================================
-double RE_HighLayerFraction(RE_Metrics &met[], int mCount, RE_Config &cfg)
-{
-   if(mCount<=0) return(0);
-
-   int idx[64];
-   for(int i=0;i<mCount;i++) idx[i]=i;
-
-   for(int i=0;i<mCount-1;i++)
-      for(int j=i+1;j<mCount;j++)
-         if(met[idx[j]].uds > met[idx[i]].uds)
-         {int t=idx[i];idx[i]=idx[j];idx[j]=t;}
-
-   int n = MathMax(1,(int)MathFloor(mCount*(1.0-cfg.highLayerQuantile)));
-   if(n>mCount) n=mCount;
-
-   double totalUDS=0, highUDS=0;
-   for(int i=0;i<mCount;i++) totalUDS+=met[i].uds;
-   if(totalUDS<=0) return(0);
-
-   for(int i=0;i<n;i++) highUDS+=met[idx[i]].uds;
-   return(highUDS/totalUDS);
-}
-
-void RE_ComputeBottomLayer(RE_Metrics &met[], int mCount, RE_Config &cfg, bool hasPrev, RE_BottomLayer &prev, RE_BottomLayer &out)
-{
-   if(mCount<=0)
-   {
-      out.pCore  = hasPrev ? prev.pCore  : 0.0;
-      out.status = hasPrev ? prev.status : 0;
-      return;
-   }
-
-   double frac = RE_HighLayerFraction(met,mCount,cfg);
-   double z    = cfg.logisticK * (frac - cfg.logisticPivot);
-   double pCore= 1.0/(1.0+MathExp(z));
-   out.pCore   = pCore;
-
-   int status;
-   if(hasPrev)
-   {
-      if(pCore >= cfg.coreUpperBand) status = 1;
-      else if(pCore <= cfg.coreLowerBand) status = 0;
-      else status = prev.status;
-   }
-   else
-   {
-      status = (pCore>=0.5 ? 1 : 0);
-   }
-   out.status = status;
-}
-
-//==================================================================
-// 11. VAR LIMITS + TRIMMING
-//==================================================================
-void RE_DynamicVarLimits(double equity, RE_RiskProfile profile, RE_RiskMode mode, double &v2Frac, double &v3Frac)
-{
-   if(equity <= 0){ v2Frac=0.05; v3Frac=0.10; return; }
-
-   if(profile == RE_PROFILE_AGGRESSIVE)
-   {
-      if(mode == RE_MODE_OVERNIGHT)
-      {
-         if(equity<1000){ v2Frac=0.07; v3Frac=0.14; }
-         else if(equity<10000){ v2Frac=0.06; v3Frac=0.12; }
-         else if(equity<100000){ v2Frac=0.05; v3Frac=0.10; }
-         else if(equity<1000000){ v2Frac=0.035; v3Frac=0.07; }
-         else if(equity<10000000){ v2Frac=0.02; v3Frac=0.04; }
-         else { v2Frac=0.01; v3Frac=0.02; }
-      }
-      else
-      {
-         if(equity<1000){ v2Frac=0.04; v3Frac=0.08; }
-         else if(equity<10000){ v2Frac=0.035; v3Frac=0.07; }
-         else if(equity<100000){ v2Frac=0.03; v3Frac=0.06; }
-         else if(equity<1000000){ v2Frac=0.025; v3Frac=0.05; }
-         else if(equity<10000000){ v2Frac=0.015; v3Frac=0.03; }
-         else { v2Frac=0.01; v3Frac=0.02; }
-      }
-   }
-   else
-   {
-      v2Frac=0.04; v3Frac=0.08;
-   }
-}
-
-bool RE_IsMicroBomb(RE_Metrics &m, RE_Config &cfg)
-{
-   if(m.distSL==0) return(true);
-   double rd = m.lots / m.distSL;
-   return(rd > cfg.rdLimit);
-}
-
-int RE_SelectTrimIndex(RE_Metrics &met[], int mCount, RE_Config &cfg)
-{
-   if(mCount<=0) return(-1);
-   int viol[64]; int vC=0;
-   for(int i=0;i<mCount;i++)
-      if(RE_IsMicroBomb(met[i],cfg)){ viol[vC]=i; vC++; }
-
-   int pool[64]; int pC=0;
-   if(vC>0){ for(int i=0;i<vC;i++) pool[pC++]=viol[i]; }
-   else { for(int i=0;i<mCount;i++) pool[pC++]=i; }
-
-   int best = pool[0];
-   for(int i=1;i<pC;i++)
-      if(met[pool[i]].uds > met[best].uds) best = pool[i];
-   return(best);
-}
-
-void RE_DecideTrim(RE_Metrics &m, RE_Config &cfg, RE_Trim &t)
-{
-   t.ticket = m.ticket;
-   if(m.lots >= cfg.minLotsForPartial)
-      t.closeLots = m.lots * cfg.partialCloseFraction;
-   else
-      t.closeLots = m.lots;
-}
-
-//==================================================================
-// 12. RAW ORDER EXECUTION HELPERS (IOC)
-//==================================================================
-bool SendMarketOrder(int direction, double lots, double sl, const string comment)
-{
-   if(lots <= 0.0) return(false);
-
-   MqlTradeRequest req;
-   MqlTradeResult  res;
-   ZeroMemory(req);
-   ZeroMemory(res);
-
-   double ask = SymbolInfoDouble(_Symbol,SYMBOL_ASK);
-   double bid = SymbolInfoDouble(_Symbol,SYMBOL_BID);
-
-   req.action      = TRADE_ACTION_DEAL;
-   req.symbol      = _Symbol;
-   req.magic       = InpMagic;
-   req.volume      = lots;
-   req.sl          = sl;
-   req.tp          = 0.0;
-   req.deviation   = 20;
-   req.type_filling= ORDER_FILLING_IOC;
-   req.type_time   = ORDER_TIME_GTC;
-   req.comment     = comment;
-
-   if(direction > 0)
-   {
-      req.type  = ORDER_TYPE_BUY;
-      req.price = ask;
-   }
-   else
-   {
-      req.type  = ORDER_TYPE_SELL;
-      req.price = bid;
-   }
-
-   if(!OrderSend(req,res))
-   {
-      Print("OrderSend failed dir=",direction," lots=",lots," retcode=",res.retcode);
-      return(false);
-   }
-
-   if(res.retcode != TRADE_RETCODE_DONE && res.retcode != TRADE_RETCODE_DONE_PARTIAL)
-   {
-      Print("OrderSend not DONE, retcode=",res.retcode);
-      return(false);
-   }
-
-   return(true);
-}
-
-bool ClosePositionPartial(ulong ticket, double lotsToClose)
-{
-   if(lotsToClose <= 0.0) return(false);
-   if(!PositionSelectByTicket(ticket)) return(false);
-
-   string sym  = PositionGetString(POSITION_SYMBOL);
-   long   mgc  = PositionGetInteger(POSITION_MAGIC);
-   long   type = PositionGetInteger(POSITION_TYPE);
-   double posLots = PositionGetDouble(POSITION_VOLUME);
-
-   if(sym != _Symbol) return(false);
-   if(mgc != InpMagic) return(false);
-
-   lotsToClose = NormalizeDouble(lotsToClose,2);
-   if(lotsToClose > posLots) lotsToClose = posLots;
-   if(lotsToClose <= 0) return(false);
-
-   double ask = SymbolInfoDouble(_Symbol,SYMBOL_ASK);
-   double bid = SymbolInfoDouble(_Symbol,SYMBOL_BID);
-
-   MqlTradeRequest req;
-   MqlTradeResult  res;
-   ZeroMemory(req);
-   ZeroMemory(res);
-
-   req.action      = TRADE_ACTION_DEAL;
-   req.symbol      = _Symbol;
-   req.magic       = InpMagic;
-   req.position    = ticket;
-   req.volume      = lotsToClose;
-   req.deviation   = 20;
-   req.type_filling= ORDER_FILLING_IOC;
-   req.type_time   = ORDER_TIME_GTC;
-   req.comment     = "SYM TRIM";
-
-   if(type == POSITION_TYPE_BUY)
-   {
-      req.type  = ORDER_TYPE_SELL;
-      req.price = bid;
-   }
-   else
-   {
-      req.type  = ORDER_TYPE_BUY;
-      req.price = ask;
-   }
-
-   if(!OrderSend(req,res))
-   {
-      Print("ClosePositionPartial failed ticket=",ticket," lots=",lotsToClose," retcode=",res.retcode);
-      return(false);
-   }
-
-   if(res.retcode != TRADE_RETCODE_DONE && res.retcode != TRADE_RETCODE_DONE_PARTIAL)
-   {
-      Print("ClosePositionPartial not DONE ticket=",ticket," retcode=",res.retcode);
-      return(false);
-   }
-
-   return(true);
-}
-
-bool ClosePositionFull(ulong ticket)
-{
-   if(!PositionSelectByTicket(ticket)) return(false);
-   double lots = PositionGetDouble(POSITION_VOLUME);
-   return(ClosePositionPartial(ticket,lots));
-}
-
-//==================================================================
-// 13. CONFIG FACTORY + BRIDGES
-//==================================================================
-int RE_ApplyTrimToPositions(RE_Position &pos[], int posCount, RE_Trim &t, RE_Position &out[])
-{
-   int n=0;
-   for(int i=0;i<posCount;i++)
-   {
-      RE_Position p = pos[i];
-      if(p.ticket != t.ticket)
-      {
-         out[n]=p; n++;
-      }
-      else
-      {
-         double newLots = p.lots - t.closeLots;
-         if(newLots > 1e-4)
-         {
-            p.lots = newLots;
-            out[n]=p; n++;
-         }
-      }
-   }
-   return(n);
-}
-
-void RE_BuildDefaultConfig(double equity, RE_Config &cfg)
-{
-   cfg.profile = RE_PROFILE_AGGRESSIVE;
-   cfg.rdLimit = 0.0095;
-   cfg.w_rd    = 0.35;
-   cfg.w_dVar2 = 0.25;
-   cfg.w_gamma = 0.20;
-   cfg.w_liq   = 0.10;
-   cfg.w_sag   = 0.10;
-   cfg.udsDangerThreshold = 0.80;
-   cfg.highLayerQuantile  = 0.75;
-   cfg.logisticK          = 8;
-   cfg.logisticPivot      = 0.26;
-   cfg.coreLowerBand      = 0.45;
-   cfg.coreUpperBand      = 0.55;
-   cfg.volSpikeMultiplier = 1.2;
-   cfg.volSpikeThreshold  = 3.0;
-
-   double liq[] = {2300,2320,2350,2380,2400,2415,2430,2450};
-   int n = ArraySize(liq);
-   cfg.liqCount = (n>32 ? 32 : n);
-   for(int i=0;i<cfg.liqCount;i++) cfg.liquidityLevels[i]=liq[i];
-
-   if(equity<1000){ cfg.partialCloseFraction=0.5; cfg.minLotsForPartial=0.02; }
-   else if(equity<10000){ cfg.partialCloseFraction=0.4; cfg.minLotsForPartial=0.03; }
-   else if(equity<100000){ cfg.partialCloseFraction=0.3; cfg.minLotsForPartial=0.03; }
-   else if(equity<1000000){ cfg.partialCloseFraction=0.25; cfg.minLotsForPartial=0.05; }
-   else { cfg.partialCloseFraction=0.15; cfg.minLotsForPartial=0.05; }
-}
-
-int RE_CollectPositions(RE_Position &out[])
-{
-   int c=0;
-   int total = PositionsTotal();
-   for(int i=0; i<total && c<64; i++)
-   {
-      ulong ticket = PositionGetTicket(i);
-      if(!PositionSelectByTicket(ticket))
-         continue;
-      string sym = PositionGetString(POSITION_SYMBOL);
-      long   mgc = PositionGetInteger(POSITION_MAGIC);
-      if(sym != _Symbol) continue;
-      if(mgc != InpMagic) continue;
-
-      long  type   = PositionGetInteger(POSITION_TYPE);
-      double lots  = PositionGetDouble(POSITION_VOLUME);
-      double price = PositionGetDouble(POSITION_PRICE_OPEN);
-      double sl    = PositionGetDouble(POSITION_SL);
-      double profit= PositionGetDouble(POSITION_PROFIT);
-      double swap  = PositionGetDouble(POSITION_SWAP);
-      double comm  = PositionGetDouble(POSITION_COMMISSION);
-
-      RE_Position p;
-      p.ticket    = (long)ticket;
-      p.lots      = lots;
-      p.entry     = price;
-      p.sl        = (sl>0 ? sl : 0.0);
-      p.direction = (type==POSITION_TYPE_BUY ? 1 : -1);
-      p.pnl       = profit + swap + comm;
-      out[c]=p; c++;
-   }
-   return(c);
-}
-
-void RE_BuildMarket(RE_Market &m)
-{
-   m.spot       = SymbolInfoDouble(_Symbol, SYMBOL_BID);
-   m.equity     = AccountInfoDouble(ACCOUNT_EQUITY);
-   m.marginUsed = AccountInfoDouble(ACCOUNT_MARGIN);
-
-   static int atr15Handle = INVALID_HANDLE;
-   static int atr30Handle = INVALID_HANDLE;
-
-   if(atr15Handle == INVALID_HANDLE)
-      atr15Handle = iATR(_Symbol, _Period, 15);
-   if(atr30Handle == INVALID_HANDLE)
-      atr30Handle = iATR(_Symbol, _Period, 30);
-
-   double buf15[1], buf30[1];
-   ArraySetAsSeries(buf15, true);
-   ArraySetAsSeries(buf30, true);
-
-   if(CopyBuffer(atr15Handle, 0, 0, 1, buf15) <= 0)
-      buf15[0] = 0.0;
-   if(CopyBuffer(atr30Handle, 0, 0, 1, buf30) <= 0)
-      buf30[0] = 0.0;
-
-   m.atr15 = buf15[0];
-   m.atr30 = buf30[0];
-}
-
-void RE_ApplyTrimsToOrders(RE_Trim &trims[], int trimCount)
-{
-   if(trimCount<=0) return;
-   for(int i=0;i<trimCount;i++)
-   {
-      long ticket = trims[i].ticket;
-      double lotsToClose = trims[i].closeLots;
-      if(lotsToClose<=0) continue;
-      ClosePositionPartial((ulong)ticket,lotsToClose);
-   }
-}
-
-//==================================================================
-// 14. RISK ENGINE DRIVER
-//==================================================================
-void RE_RunRiskEngine(RE_RiskMode mode,
-                      RE_Position &initPos[], int initCount,
-                      RE_Market &m,
-                      RE_Config &cfg,
-                      RE_ModelState &ms,
-                      bool hasPrevBottom,
-                      RE_BottomLayer &prevBottom,
-                      RE_RiskResult &out)
-{
-   out.posCount  = 0;
-   out.metCount  = 0;
-   out.trimCount = 0;
-   out.udsMax    = 0;
-   out.anyBomb   = false;
-   out.varRes.var2=0;
-   out.varRes.var3=0;
-
-   RE_Position pos[64];
-   int posCount = initCount;
-   for(int i=0;i<posCount;i++) pos[i]=initPos[i];
-
-   RE_BottomLayer bottomLocal;
-
-   while(true)
-   {
-      if(posCount<=0)
-      {
-         bottomLocal.pCore  = hasPrevBottom ? prevBottom.pCore  : 0.0;
-         bottomLocal.status = hasPrevBottom ? prevBottom.status : 0;
-         out.bottom = bottomLocal;
-         return;
-      }
-
-      RE_Metrics met[64];
-      int mCount = RE_BuildMetrics(pos,posCount,m,cfg,ms,met);
-
-      RE_VarResult vr;
-      RE_ComputeVaR(pos,posCount,m,cfg,vr);
-
-      double v2Frac,v3Frac;
-      RE_DynamicVarLimits(m.equity,cfg.profile,mode,v2Frac,v3Frac);
-      double v2Lim = v2Frac*m.equity;
-      double v3Lim = v3Frac*m.equity;
-
-      bool var2Ok = (vr.var2 <= v2Lim);
-      bool var3Ok = (vr.var3 <= v3Lim);
-
-      double udsMax=0; bool anyBomb=false;
-      for(int i=0;i<mCount;i++)
-      {
-         if(met[i].uds > udsMax) udsMax=met[i].uds;
-         if(RE_IsMicroBomb(met[i],cfg)) anyBomb=true;
-      }
-
-      RE_ComputeBottomLayer(met,mCount,cfg,hasPrevBottom,prevBottom,bottomLocal);
-
-      bool allOk = (var2Ok && var3Ok && !anyBomb);
-      if(allOk)
-      {
-         for(int i=0;i<posCount;i++) out.positions[i]=pos[i];
-         for(int i=0;i<mCount;i++)  out.metrics[i]=met[i];
-         out.posCount  = posCount;
-         out.metCount  = mCount;
-         out.varRes    = vr;
-         out.bottom    = bottomLocal;
-         out.udsMax    = udsMax;
-         out.anyBomb   = anyBomb;
-         return;
-      }
-
-      int idx = RE_SelectTrimIndex(met,mCount,cfg);
-      if(idx<0)
-      {
-         for(int i=0;i<posCount;i++) out.positions[i]=pos[i];
-         for(int i=0;i<mCount;i++)   out.metrics[i]=met[i];
-         out.posCount = posCount;
-         out.metCount = mCount;
-         out.varRes   = vr;
-         out.bottom   = bottomLocal;
-         out.udsMax   = udsMax;
-         out.anyBomb  = anyBomb;
-         return;
-      }
-
-      RE_Trim tr;
-      RE_DecideTrim(met[idx],cfg,tr);
-      out.trims[out.trimCount] = tr;
-      out.trimCount++;
-
-      RE_Position newPos[64];
-      int newCount = RE_ApplyTrimToPositions(pos,posCount,tr,newPos);
-      posCount = newCount;
-      for(int i=0;i<posCount;i++) pos[i]=newPos[i];
-   }
-}
-
-//==================================================================
 // 15. TRADING EXECUTION - ONLY PHASE 3 & PHASE 4 ENTRIES (RAW REQUEST)
 //==================================================================
 void ExecuteTrading()
@@ -1445,8 +634,6 @@ void ExecuteTrading()
    double equity   = AccountInfoDouble(ACCOUNT_EQUITY);
    double riskCash = equity * InpRiskPercent * 0.01;
 
-   if(InpEnableRiskEngine && InpBlockNewIfBreach && !g_lastRiskOk)
-      return;
 
    // Time filter
    if(!IsTradeTime())
@@ -1638,7 +825,124 @@ void ManageArcInstitutionalExits()
 }
 
 //==================================================================
-// 17. STANDARD CALLBACKS
+// 17. PROFIT PROTECTION — breakeven + peak-giveback ratchet + R-tiered partials
+//     Runs every bar for every EA position, INDEPENDENT of g_mode.
+//     The peak-giveback ratchet is the core mechanism: it locks a fraction
+//     of the BEST price a position has ever reached, so a +$3k position
+//     cannot collapse to +$300 on a pop-and-reverse.
+//==================================================================
+int PC_Find(long ticket)
+{
+   for(int i=0;i<g_pcCount;i++) if(g_pc[i].ticket==ticket) return i;
+   if(g_pcCount<PC_MAX)
+   { g_pc[g_pcCount].ticket=ticket; g_pc[g_pcCount].peakFav=0.0; g_pc[g_pcCount].tierFlags=0; return g_pcCount++; }
+   return -1;
+}
+void PC_Prune()
+{
+   int w=0;
+   for(int i=0;i<g_pcCount;i++)
+      if(PositionSelectByTicket((ulong)g_pc[i].ticket)&&PositionGetString(POSITION_SYMBOL)==_Symbol&&PositionGetInteger(POSITION_MAGIC)==InpMagic)
+      { g_pc[w]=g_pc[i]; w++; }
+   g_pcCount=w;
+}
+
+void ManageProfitProtection()
+{
+   if(!InpUseTrailing && !InpUseGivebackTrail && !InpUseTieredPartials){ PC_Prune(); return; }
+   double atr = GetATR(1);
+   if(atr<=0.0){ PC_Prune(); return; }
+   double bid     = SymbolInfoDouble(_Symbol,SYMBOL_BID);
+   double ask     = SymbolInfoDouble(_Symbol,SYMBOL_ASK);
+   long   stopsLvl= SymbolInfoInteger(_Symbol,SYMBOL_TRADE_STOPS_LEVEL);
+   double minDist = stopsLvl*_Point;
+   double minLot  = SymbolInfoDouble(_Symbol,SYMBOL_VOLUME_MIN);
+
+   // Gather all EA positions; rank by profit for top-N aggressive lock.
+   ulong tk[256]; int dr[256]; double ent[256]; double prof[256]; int cnt=0;
+   int total=PositionsTotal();
+   for(int i=0;i<total&&cnt<256;i++)
+   {
+      ulong t=PositionGetTicket(i);
+      if(!PositionSelectByTicket(t)) continue;
+      if(PositionGetString(POSITION_SYMBOL)!=_Symbol) continue;
+      if(PositionGetInteger(POSITION_MAGIC)!=InpMagic) continue;
+      tk[cnt]=t; dr[cnt]=(PositionGetInteger(POSITION_TYPE)==POSITION_TYPE_BUY?1:-1);
+      ent[cnt]=PositionGetDouble(POSITION_PRICE_OPEN); prof[cnt]=PositionGetDouble(POSITION_PROFIT); cnt++;
+   }
+   if(cnt==0){ PC_Prune(); return; }
+
+   // Sort descending by profit to identify top-N winners.
+   int order[256]; for(int i=0;i<cnt;i++) order[i]=i;
+   for(int i=0;i<cnt-1;i++) for(int j=i+1;j<cnt;j++)
+      if(prof[order[j]]>prof[order[i]]){ int t=order[i];order[i]=order[j];order[j]=t; }
+   bool topN[256]; for(int i=0;i<cnt;i++) topN[i]=false;
+   for(int k=0;k<InpAggTrailTopN&&k<cnt;k++) if(prof[order[k]]>0.0) topN[order[k]]=true;
+
+   for(int i=0;i<cnt;i++)
+   {
+      ulong ticket=tk[i];
+      if(!PositionSelectByTicket(ticket)) continue;
+      int    d    =dr[i];
+      double entry=ent[i];
+      double curSL=PositionGetDouble(POSITION_SL);
+      double lots =PositionGetDouble(POSITION_VOLUME);
+      double curFav=(d==1?bid-entry:entry-ask);
+
+      // Update peak favorable in registry.
+      int ri=PC_Find((long)ticket);
+      if(ri>=0 && curFav>g_pc[ri].peakFav) g_pc[ri].peakFav=curFav;
+      double peakFav=(ri>=0?g_pc[ri].peakFav:MathMax(curFav,0.0));
+
+      // R-unit: original distSL; if SL moved past entry fall back to ATR.
+      double distSL=0.0;
+      if(d==1) distSL=(curSL>0.0&&curSL<entry)?(entry-curSL):atr;
+      else     distSL=(curSL>0.0&&curSL>entry)?(curSL-entry):atr;
+      if(distSL<=0.0) distSL=atr;
+      double R=curFav/distSL;
+
+      // --- R-tiered partials (highest tier first, one per bar) ---
+      if(InpUseTieredPartials&&ri>=0&&R>0.0)
+      {
+         double tR[3]; double tPct[3]; int tBit[3];
+         tR[0]=InpPartial3R; tPct[0]=InpPartial3Pct; tBit[0]=4;
+         tR[1]=InpPartial2R; tPct[1]=InpPartial2Pct; tBit[1]=2;
+         tR[2]=InpPartial1R; tPct[2]=InpPartial1Pct; tBit[2]=1;
+         for(int k=0;k<3;k++)
+         {
+            if(R>=tR[k]&&!(g_pc[ri].tierFlags&tBit[k]))
+            {
+               double cut=NormalizeDouble(lots*tPct[k],2);
+               if(cut>=minLot&&lots-cut>=minLot)
+                  if(ClosePositionPartial(ticket,cut)) g_pc[ri].tierFlags|=tBit[k];
+               break;
+            }
+         }
+         if(!PositionSelectByTicket(ticket)) continue;
+         curSL=PositionGetDouble(POSITION_SL);
+      }
+
+      // --- Breakeven + peak-giveback ratchet ---
+      double newSL=curSL;
+      if(InpUseTrailing&&curFav>=InpBETriggerAtr*atr)
+      {
+         double be=entry+d*InpBELockAtr*atr;
+         if((be-newSL)*d>0) newSL=be;
+      }
+      if(InpUseGivebackTrail&&peakFav>=InpGivebackTrigAtr*atr)
+      {
+         double lockFrac=topN[i]?InpGivebackLockTop:InpGivebackLock;
+         double cand=entry+d*lockFrac*peakFav;
+         if((cand-newSL)*d>0) newSL=cand;
+      }
+      if(d==1){ if(newSL>curSL&&newSL<=bid-minDist) ModifyPositionSL(ticket,newSL); }
+      else    { if((curSL<=0.0||newSL<curSL)&&newSL>=ask+minDist) ModifyPositionSL(ticket,newSL); }
+   }
+   PC_Prune();
+}
+
+//==================================================================
+// 18. STANDARD CALLBACKS
 //==================================================================
 int OnInit()
 {
@@ -1679,16 +983,14 @@ int OnInit()
    g_lastLongTradeTime  = 0;
    g_lastShortTradeTime = 0;
 
+   g_pcCount = 0;
+
    double eq = AccountInfoDouble(ACCOUNT_EQUITY);
-   RE_BuildDefaultConfig(eq,g_reConfig);
-   g_reModelState.hasWeights = false;
-   g_reBottomInit            = false;
-   g_lastRiskOk              = true;
 
    if(!RefreshSeries())
       return(INIT_FAILED);
 
-   Print("SYMPHONY Elite Max - Phase 3+4 + DRDWCT v1.6 + ARC v2 (MT5 RAW, IOC, time-gated) loaded.");
+   Print("SYMPHONY Elite Max v2.2 - Phase 3+4 + ARC v2 + profit protection (MT5 RAW, IOC, time-gated) loaded.");
    return(INIT_SUCCEEDED);
 }
 
@@ -1710,44 +1012,11 @@ void OnTick()
    // 2) Update ARC v2 (convexity arc)
    UpdateARC();
 
-   // 3) Run risk engine and trim if needed
-   if(InpEnableRiskEngine)
-   {
-      RE_Position pos[64];
-      int posCount = RE_CollectPositions(pos);
-      if(posCount>0)
-      {
-         RE_Market m;
-         RE_BuildMarket(m);
-
-         RE_RiskResult res;
-         RE_RunRiskEngine(RE_MODE_INTRADAY,pos,posCount,m,g_reConfig,g_reModelState,
-                          g_reBottomInit,g_reBottom,res);
-
-         RE_ApplyTrimsToOrders(res.trims,res.trimCount);
-
-         g_reBottom     = res.bottom;
-         g_reBottomInit = true;
-
-         double v2Frac,v3Frac;
-         RE_DynamicVarLimits(m.equity,g_reConfig.profile,RE_MODE_INTRADAY,v2Frac,v3Frac);
-         double v2Lim=v2Frac*m.equity, v3Lim=v3Frac*m.equity;
-         bool var2Ok=(res.varRes.var2<=v2Lim);
-         bool var3Ok=(res.varRes.var3<=v3Lim);
-         g_lastRiskOk = (var2Ok && var3Ok && !res.anyBomb);
-      }
-      else
-      {
-         g_lastRiskOk = true;
-      }
-   }
-   else
-   {
-      g_lastRiskOk = true;
-   }
-
-   // 4) ARC + institutional + phase composite exits (replaces old structural TP)
+   // 3) ARC + institutional + phase composite exits
    ManageArcInstitutionalExits();
+
+   // 4) Profit protection: peak-giveback ratchet + R-tiered partials
+   ManageProfitProtection();
 
    // 5) Open new Phase 3 / Phase 4 trades (time-gated inside)
    ExecuteTrading();
