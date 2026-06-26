@@ -125,13 +125,13 @@ input bool   InpBlockDec          = true;   // Block December entries
 // Hour 14 (pre-NY lull, 26% WR, -5.1R) is blocked outright.
 //==================================================================
 input bool   InpAsiaRaidBias      = true;   // London-open Asia-raid directional gate
-input int    InpAsiaStartMin      = 0;      // Asia window start (GMT min, 00:00)
-input int    InpAsiaEndMin        = 420;    // Asia window end   (GMT min, 07:00)
-input int    InpLondonOpenStart   = 480;    // London-open gate start (08:00)
-input int    InpLondonOpenEnd     = 660;    // London-open gate end   (11:00)
-input bool   InpBlockPreNY        = true;   // Block 14:00-14:55 pre-NY lull
-input int    InpPreNYStart        = 840;    // 14:00
-input int    InpPreNYEnd          = 895;    // 14:55
+input int    InpAsiaStartMin      = 0;      // Asia window start (SERVER min, 00:00)
+input int    InpAsiaEndMin        = 420;    // Asia window end   (SERVER min, 07:00)
+input int    InpLondonOpenStart   = 480;    // London-open gate start (SERVER 08:00)
+input int    InpLondonOpenEnd     = 660;    // London-open gate end   (SERVER 11:00)
+input bool   InpBlockPreNY        = true;   // Block 14:00-14:55 pre-NY lull (server)
+input int    InpPreNYStart        = 840;    // 14:00 server
+input int    InpPreNYEnd          = 895;    // 14:55 server
 
 //==================================================================
 // 1H. R-1 HIGHER-TF TREND GATE ON SHORTS
@@ -1084,7 +1084,7 @@ void RunProfitLadder()
 
 //==================================================================
 // 13B. ASIA RANGE TRACKING + LONDON-OPEN RAID BIAS
-// Called every bar. Builds the Asia high/low (00:00-07:00 GMT),
+// Called every bar. Builds the Asia high/low (00:00-07:00 server time),
 // then after Asia close watches for a sweep of either extreme.
 //==================================================================
 void UpdateAsiaRange()
