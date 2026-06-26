@@ -1,8 +1,9 @@
 //+------------------------------------------------------------------+
-//| SYMPHONY_Physics_Engine_Elite_Max_Phase34_DRDWCT_v1_7.mq5       |
-//| Phase Engine (curvature-based) + DRDWCT v1.7 Risk Engine        |
-//| Risk engine v2: campaign-centric, age/quality/trend aware,      |
-//|   graduated intervention (protects winners, cuts losers)        |
+//| SYMPHONY_Physics_Engine_Elite_Max_Phase34_DRDWCT_v1_8.mq5       |
+//| Phase Engine (curvature-based) + DRDWCT v1.8 Risk Engine        |
+//| Risk engine v3: MULTI-CAMPAIGN (long & short books at once),    |
+//|   per-direction gross risk (no netting) + portfolio backstop,   |
+//|   age/quality aware, graduated intervention, trailing exits     |
 //| Entries: Phase 3 + Phase 4 only (long & short)                  |
 //| TP: ARC + institutional sweep + phase-change composite exit     |
 //| MT5 HEDGING VERSION - RAW MqlTradeRequest (IOC)                 |
@@ -88,7 +89,8 @@ input int    InpMinBarsBeforeTrim = 3;      // Position age gate: min bars open 
 input double InpMinAdverseRToTrim = 0.50;   // Adverse excursion (R) that lets a YOUNG leg be trimmed early
 input double InpMaxLegRiskMult    = 3.0;    // Micro-bomb: leg risk-to-SL > this * intended per-trade risk
 input double InpCampaignVarMult   = 1.0;    // Scale on campaign VaR limits (>1 = more room for pyramiding)
-input double InpHardBreachMult    = 2.0;    // Overage ratio that blocks new entries (hard breach)
+input double InpHardBreachMult    = 2.0;    // Per-campaign overage ratio that blocks new entries
+input double InpPortfolioVarMult  = 3.0;    // Portfolio gross-VaR hard breach (x base v3 limit, ALL campaigns)
 input double InpLiqLookbackBars   = 120;    // Lookback for dynamic liquidity / swing levels
 
 //==================================================================
@@ -101,7 +103,7 @@ input double InpBETriggerAtr      = 1.0;    // Move SL to breakeven after this f
 input double InpBELockAtr         = 0.10;   // Breakeven lock buffer beyond entry (ATR)
 input double InpTrailStartAtr     = 1.5;    // Start trailing after this favorable move (ATR)
 input double InpTrailDistAtr      = 1.5;    // Trailing distance kept behind price (ATR)
-input bool   InpExitOnFlip        = false;  // Also close a leg if a fresh opposite impulse forms
+input bool   InpExitOnFlip        = false;  // Close a leg on opposite impulse (WARNING: disables multi-campaign)
 input bool   InpUseArcTP          = false;  // Place a hard TP at the ARC extension target on entry
 
 // Timing - target session timezone (GMT baseline)
@@ -1054,21 +1056,21 @@ int RE_BuildMetrics(RE_Position &pos[], int posCount, RE_Market &m, RE_Config &c
    RE_ComputeDeltaVar2(pos,posCount,m,cfg,dVar2Arr);
    for(int i=0;i<posCount;i++) met[i].dVar2 = dVar2Arr[i];
 
-   // --- PROTECTION FILTER (Step 8/9/10/13): shield young & winning trend legs ---
+   // --- PROTECTION FILTER (Step 8/9/10/13) ---
+   // Direction-AGNOSTIC so it works across MULTIPLE simultaneous campaigns
+   // (long AND short books open at once). A leg is protected by its OWN state
+   // - age and profit - not by whichever impulse happens to be newest (g_mode).
    for(int i=0;i<posCount;i++)
    {
-      int dir = met[i].direction;
-      bool trendAligned = (dir == ctx.mode && ctx.mode != 0);
-      int  ph     = (dir > 0 ? ctx.phaseLong : ctx.phaseShort);
-      bool phaseOK= (trendAligned && (ph == 3 || ph == 4));
+      int  dir    = met[i].direction;
       bool arcExh = (dir > 0 ? ctx.arcExhaustLong : ctx.arcExhaustShort);
       bool young  = (met[i].barsOpen < InpMinBarsBeforeTrim);
 
       bool prot = false;
-      // Age gate: a brand-new leg is untouchable unless it is already deep under water
+      // Age gate: a brand-new leg is untouchable unless already deep under water
       if(young && met[i].adverseR < InpMinAdverseRToTrim) prot = true;
-      // Winner / trend protection: in profit, phase still valid, ARC not exhausted
-      if(phaseOK && met[i].rMultiple > 0.0 && !arcExh) prot = true;
+      // Winner protection: in profit and its campaign destination (ARC) not yet reached
+      if(met[i].rMultiple > 0.0 && !arcExh) prot = true;
 
       met[i].isProtected = prot;
    }
@@ -1580,8 +1582,116 @@ void RE_ApplyTrimsToOrders(RE_Trim &trims[], int trimCount)
 }
 
 //==================================================================
-// 14. RISK ENGINE DRIVER
+// 14. RISK ENGINE DRIVER  (MULTI-CAMPAIGN)
+// Symphony intentionally runs MULTIPLE simultaneous campaigns (long AND
+// short books at once). Each direction is risk-managed on its OWN gross
+// exposure - opposite books are NEVER netted, so a bleeding side can never
+// be masked by the other. A portfolio backstop caps combined gross VaR.
 //==================================================================
+
+// Process ONE single-direction campaign. VaR is computed only within this
+// campaign (all legs same direction -> true gross exposure, no cancellation).
+// Surviving legs/metrics and any trims are APPENDED to `out`; worst overage,
+// bomb flag and hard-breach are aggregated across campaigns.
+void RE_ProcessCampaign(RE_RiskMode mode,
+                        RE_Position &cpos[], int ccount,
+                        RE_Market &m, RE_Config &cfg, RE_ModelState &ms, RE_TrendContext &ctx,
+                        double intendedRisk, double lotStep,
+                        RE_RiskResult &out)
+{
+   if(ccount <= 0) return;
+
+   RE_Position pos[64];
+   int posCount = ccount;
+   for(int i=0;i<posCount && i<64;i++) pos[i]=cpos[i];
+
+   double v2Frac,v3Frac;
+   RE_DynamicVarLimits(m.equity,cfg.profile,mode,v2Frac,v3Frac);
+   double v2Lim = v2Frac*m.equity*InpCampaignVarMult;
+   double v3Lim = v3Frac*m.equity*InpCampaignVarMult;
+
+   int guard = 0;
+   while(true)
+   {
+      if(++guard > 256) break;
+      if(posCount<=0)   break;
+
+      RE_Metrics met[64];
+      int mCount = RE_BuildMetrics(pos,posCount,m,cfg,ms,ctx,met);
+
+      RE_VarResult vr;
+      RE_ComputeVaR(pos,posCount,m,cfg,vr);
+
+      double overage = 0.0;
+      if(v2Lim > 0) overage = MathMax(overage, vr.var2/v2Lim);
+      if(v3Lim > 0) overage = MathMax(overage, vr.var3/v3Lim);
+      int level = RE_RiskLevel(overage);
+
+      // ---- 1) MICRO-BOMB CORRECTION (oversized leg) ----
+      int bombIdx = -1;
+      for(int i=0;i<mCount;i++)
+      {
+         if(!met[i].isBomb) continue;
+         double allowed = RE_AllowedBombLots(met[i], intendedRisk);
+         if(met[i].lots - allowed >= lotStep) { bombIdx = i; break; }
+      }
+      if(bombIdx >= 0)
+      {
+         double allowed = RE_AllowedBombLots(met[bombIdx], intendedRisk);
+         RE_Trim tr;
+         tr.ticket    = met[bombIdx].ticket;
+         tr.closeLots = met[bombIdx].lots - allowed;
+         if(out.trimCount < 64){ out.trims[out.trimCount]=tr; out.trimCount++; }
+
+         RE_Position newPos[64];
+         posCount = RE_ApplyTrimToPositions(pos,posCount,tr,newPos);
+         for(int i=0;i<posCount;i++) pos[i]=newPos[i];
+         continue;
+      }
+
+      // ---- 2) GRADUATED VaR INTERVENTION ----
+      if(level <= 1) break;                          // campaign within limits
+
+      int idx = RE_SelectTrimIndex(met,mCount,cfg,level);
+      if(idx < 0) break;                             // only protected legs left -> let them run
+
+      RE_Trim tr;
+      RE_DecideTrim(met[idx],cfg,level,tr);
+      if(out.trimCount < 64){ out.trims[out.trimCount]=tr; out.trimCount++; }
+
+      RE_Position newPos[64];
+      posCount = RE_ApplyTrimToPositions(pos,posCount,tr,newPos);
+      for(int i=0;i<posCount;i++) pos[i]=newPos[i];
+   }
+
+   // ---- Final post-trim state for aggregation + reporting ----
+   RE_Metrics   fmet[64]; int fCount=0;
+   RE_VarResult fvr; fvr.var2=0; fvr.var3=0;
+   double fOverage=0.0; int fLevel=1;
+   if(posCount>0)
+   {
+      fCount = RE_BuildMetrics(pos,posCount,m,cfg,ms,ctx,fmet);
+      RE_ComputeVaR(pos,posCount,m,cfg,fvr);
+      if(v2Lim>0) fOverage=MathMax(fOverage,fvr.var2/v2Lim);
+      if(v3Lim>0) fOverage=MathMax(fOverage,fvr.var3/v3Lim);
+      fLevel=RE_RiskLevel(fOverage);
+      for(int i=0;i<fCount;i++)
+      {
+         if(fmet[i].uds > out.udsMax) out.udsMax = fmet[i].uds;
+         if(fmet[i].isBomb)           out.anyBomb = true;
+      }
+   }
+
+   if(fOverage > out.overage)  out.overage   = fOverage;
+   if(fLevel   > out.riskLevel) out.riskLevel = fLevel;
+   out.varRes.var2 += fvr.var2;   // campaigns do NOT net -> sum = gross portfolio VaR
+   out.varRes.var3 += fvr.var3;
+   if(fOverage > InpHardBreachMult) out.hardBreach = true;
+
+   for(int i=0;i<posCount && out.posCount<64;i++) out.positions[out.posCount++]=pos[i];
+   for(int i=0;i<fCount   && out.metCount<64;i++) out.metrics[out.metCount++]=fmet[i];
+}
+
 void RE_RunRiskEngine(RE_RiskMode mode,
                       RE_Position &initPos[], int initCount,
                       RE_Market &m,
@@ -1609,137 +1719,35 @@ void RE_RunRiskEngine(RE_RiskMode mode,
    double lotStep = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
    if(lotStep <= 0.0) lotStep = 0.01;
 
-   RE_Position pos[64];
-   int posCount = initCount;
-   for(int i=0;i<posCount;i++) pos[i]=initPos[i];
-
-   RE_BottomLayer bottomLocal;
-
-   // The whole open book IS the active campaign (Symphony holds one impulse
-   // direction at a time). VaR nets across legs, so this is aggregate campaign
-   // risk - correlated pyramid adds are NOT double-counted as independent risks.
-   int guard = 0;
-   while(true)
+   // Split the open book into independent direction campaigns.
+   RE_Position longs[64];  int longCount  = 0;
+   RE_Position shorts[64]; int shortCount = 0;
+   for(int i=0;i<initCount;i++)
    {
-      if(++guard > 256) break;
-
-      if(posCount<=0)
-      {
-         bottomLocal.pCore  = hasPrevBottom ? prevBottom.pCore  : 0.0;
-         bottomLocal.status = hasPrevBottom ? prevBottom.status : 0;
-         out.bottom = bottomLocal;
-         out.posCount  = 0;
-         out.metCount  = 0;
-         out.hardBreach= false;
-         out.riskLevel = 1;
-         out.overage   = 0.0;
-         return;
-      }
-
-      RE_Metrics met[64];
-      int mCount = RE_BuildMetrics(pos,posCount,m,cfg,ms,ctx,met);
-
-      RE_VarResult vr;
-      RE_ComputeVaR(pos,posCount,m,cfg,vr);
-
-      double v2Frac,v3Frac;
-      RE_DynamicVarLimits(m.equity,cfg.profile,mode,v2Frac,v3Frac);
-      double v2Lim = v2Frac*m.equity*InpCampaignVarMult;
-      double v3Lim = v3Frac*m.equity*InpCampaignVarMult;
-
-      double overage = 0.0;
-      if(v2Lim > 0) overage = MathMax(overage, vr.var2/v2Lim);
-      if(v3Lim > 0) overage = MathMax(overage, vr.var3/v3Lim);
-      int level = RE_RiskLevel(overage);
-
-      double udsMax=0; bool anyBomb=false;
-      for(int i=0;i<mCount;i++)
-      {
-         if(met[i].uds > udsMax) udsMax=met[i].uds;
-         if(met[i].isBomb) anyBomb=true;
-      }
-
-      RE_ComputeBottomLayer(met,mCount,cfg,hasPrevBottom,prevBottom,bottomLocal);
-
-      // ---- 1) MICRO-BOMB CORRECTION (sizing error) ----
-      // Always trim the oversized EXCESS only (bypasses age gate: a 3x-risk leg
-      // is a genuine extreme event), never the whole leg, never a winner wholesale.
-      int bombIdx = -1;
-      for(int i=0;i<mCount;i++)
-      {
-         if(!met[i].isBomb) continue;
-         double allowed = RE_AllowedBombLots(met[i], intendedRisk);
-         double excess  = met[i].lots - allowed;
-         if(excess >= lotStep) { bombIdx = i; break; }
-      }
-      if(bombIdx >= 0)
-      {
-         double allowed = RE_AllowedBombLots(met[bombIdx], intendedRisk);
-         double excess  = met[bombIdx].lots - allowed;
-
-         RE_Trim tr;
-         tr.ticket    = met[bombIdx].ticket;
-         tr.closeLots = excess;
-         out.trims[out.trimCount] = tr;
-         out.trimCount++;
-
-         RE_Position newPos[64];
-         int newCount = RE_ApplyTrimToPositions(pos,posCount,tr,newPos);
-         posCount = newCount;
-         for(int i=0;i<posCount;i++) pos[i]=newPos[i];
-         continue;
-      }
-
-      // ---- 2) GRADUATED VaR INTERVENTION ----
-      if(level <= 1)
-      {
-         // Within campaign limits: DO NOTHING. Let trades develop.
-         for(int i=0;i<posCount;i++) out.positions[i]=pos[i];
-         for(int i=0;i<mCount;i++)   out.metrics[i]=met[i];
-         out.posCount  = posCount;
-         out.metCount  = mCount;
-         out.varRes    = vr;
-         out.bottom    = bottomLocal;
-         out.udsMax    = udsMax;
-         out.anyBomb   = anyBomb;
-         out.overage   = overage;
-         out.riskLevel = level;
-         out.hardBreach= false;
-         return;
-      }
-
-      int idx = RE_SelectTrimIndex(met,mCount,cfg,level);
-      if(idx<0)
-      {
-         // Over limit but every eligible leg is PROTECTED (young / winning / trend-aligned)
-         // and we are below emergency level -> accept the breach, let winners run.
-         for(int i=0;i<posCount;i++) out.positions[i]=pos[i];
-         for(int i=0;i<mCount;i++)   out.metrics[i]=met[i];
-         out.posCount  = posCount;
-         out.metCount  = mCount;
-         out.varRes    = vr;
-         out.bottom    = bottomLocal;
-         out.udsMax    = udsMax;
-         out.anyBomb   = anyBomb;
-         out.overage   = overage;
-         out.riskLevel = level;
-         out.hardBreach= (overage > InpHardBreachMult);
-         return;
-      }
-
-      RE_Trim tr;
-      RE_DecideTrim(met[idx],cfg,level,tr);
-      out.trims[out.trimCount] = tr;
-      out.trimCount++;
-
-      RE_Position newPos[64];
-      int newCount = RE_ApplyTrimToPositions(pos,posCount,tr,newPos);
-      posCount = newCount;
-      for(int i=0;i<posCount;i++) pos[i]=newPos[i];
+      if(initPos[i].direction > 0) { if(longCount  < 64) longs[longCount++]   = initPos[i]; }
+      else                         { if(shortCount < 64) shorts[shortCount++] = initPos[i]; }
    }
 
-   // Safety fall-through (guard tripped): report current state.
-   out.bottom = bottomLocal;
+   if(longCount  > 0) RE_ProcessCampaign(mode,longs, longCount, m,cfg,ms,ctx,intendedRisk,lotStep,out);
+   if(shortCount > 0) RE_ProcessCampaign(mode,shorts,shortCount,m,cfg,ms,ctx,intendedRisk,lotStep,out);
+
+   // ---- PORTFOLIO BACKSTOP ----
+   // Combined GROSS VaR across all campaigns (they do not net). Only gates NEW
+   // entries (hard breach); it never force-trims otherwise healthy campaigns.
+   double v2Frac,v3Frac;
+   RE_DynamicVarLimits(m.equity,cfg.profile,mode,v2Frac,v3Frac);
+   double v3LimPortfolio = v3Frac * m.equity * InpPortfolioVarMult;
+   if(v3LimPortfolio > 0 && out.varRes.var3 > v3LimPortfolio)
+      out.hardBreach = true;
+
+   // Bottom layer (reporting only) over the combined surviving metrics.
+   if(out.metCount > 0)
+      RE_ComputeBottomLayer(out.metrics,out.metCount,cfg,hasPrevBottom,prevBottom,out.bottom);
+   else
+   {
+      out.bottom.pCore  = hasPrevBottom ? prevBottom.pCore  : 0.0;
+      out.bottom.status = hasPrevBottom ? prevBottom.status : 0;
+   }
 }
 
 //==================================================================
@@ -2099,7 +2107,7 @@ int OnInit()
    if(!RefreshSeries())
       return(INIT_FAILED);
 
-   Print("SYMPHONY Elite Max - Phase 3+4 + DRDWCT v1.7 (campaign-centric risk) + ARC v2 (MT5 RAW, IOC, time-gated) loaded.");
+   Print("SYMPHONY Elite Max - Phase 3+4 + DRDWCT v1.8 (multi-campaign risk) + ARC v2 (MT5 RAW, IOC, time-gated) loaded.");
    return(INIT_SUCCEEDED);
 }
 
