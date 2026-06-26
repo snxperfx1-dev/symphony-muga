@@ -86,13 +86,18 @@ input int    InpMagic             = 240220; // EA magic number
 // Fires independently every bar from live position PnL.
 // Anchored to broker positions - survives phase-engine resets.
 // Rungs are multiples of current basket dollar-risk-at-SL.
+// Defaults set early (0.3x/0.75x/1.5x) so the first capture
+// fires well before the peak, not near it.
 //==================================================================
-input double InpLadderRung1       = 1.0;    // Rung 1 trigger (PnL >= 1x basket risk)
-input double InpLadderRung2       = 2.0;    // Rung 2 trigger
-input double InpLadderRung3       = 3.5;    // Rung 3 trigger
-input double InpLadderFrac1       = 0.25;   // Lot fraction to close at rung 1
+input double InpLadderRung1       = 0.3;    // Rung 1 trigger (PnL >= 0.3x basket risk)
+input double InpLadderRung2       = 0.75;   // Rung 2 trigger
+input double InpLadderRung3       = 1.5;    // Rung 3 trigger
+input double InpLadderFrac1       = 0.20;   // Lot fraction to close at rung 1
 input double InpLadderFrac2       = 0.25;   // Lot fraction to close at rung 2
 input double InpLadderFrac3       = 0.25;   // Lot fraction to close at rung 3
+// After rung 1: remaining stops moved to breakeven automatically.
+// After rung 2: stops trailed to lock in InpTrailLockPct of move.
+input double InpTrailLockPct      = 50.0;   // % of price move to lock after rung 2
 
 //==================================================================
 // 1F. KILL SWITCH
@@ -161,14 +166,25 @@ int      g_phaseAtInvalidLong    = 0;
 int      g_phaseAtInvalidShort   = 0;
 
 //==================================================================
-// 4. GLOBAL STATE - PROFIT LADDER
+// 4. GLOBAL STATE - PROFIT LADDER + STOP PROTECTION
 // Rung counters reset only when the direction's position count
 // reaches zero (campaign fully closed). They survive phase-engine
 // resets because they are keyed to live broker positions, not
 // the internal campaign state object.
+//
+// BE flags: once set, ALL remaining positions in that direction
+// must have their stops at or better than entry. Prevents a
+// full reversal from wiping profit after a rung fires.
+//
+// Trail flags: once set (after Rung 2), stops are trailed every
+// bar to lock in InpTrailLockPct of the price move from entry.
 //==================================================================
 int      g_longRungs         = 0;   // 0-3 rungs fired for long book
 int      g_shortRungs        = 0;   // 0-3 rungs fired for short book
+bool     g_longBEActive      = false; // move long stops to breakeven
+bool     g_shortBEActive     = false; // move short stops to breakeven
+bool     g_longTrailActive   = false; // trail long stops
+bool     g_shortTrailActive  = false; // trail short stops
 
 //==================================================================
 // 5. GLOBAL STATE - KILL SWITCH
@@ -653,6 +669,132 @@ bool ClosePositionFull(ulong ticket, const string tag = "SYM CLOSE")
    return ClosePositionPartial(ticket, lots, tag);
 }
 
+//==================================================================
+// 12B. STOP PROTECTION HELPERS
+//==================================================================
+
+// Returns total floating PnL (profit+swap+commission) for one direction.
+double GetDirectionFloatingPnL(int direction)
+{
+   double total = 0.0;
+   int cnt = PositionsTotal();
+   for(int i = 0; i < cnt; i++)
+   {
+      ulong ticket = PositionGetTicket(i);
+      if(!PositionSelectByTicket(ticket)) continue;
+      if(PositionGetString(POSITION_SYMBOL) != _Symbol)   continue;
+      if(PositionGetInteger(POSITION_MAGIC)  != InpMagic) continue;
+      long type = PositionGetInteger(POSITION_TYPE);
+      if((type == POSITION_TYPE_BUY ? 1 : -1) != direction) continue;
+      total += PositionGetDouble(POSITION_PROFIT)
+             + PositionGetDouble(POSITION_SWAP)
+             + PositionGetDouble(POSITION_COMMISSION);
+   }
+   return total;
+}
+
+// Move all remaining stops in a direction to at least breakeven (entry price).
+// For longs: SL must be >= entry. For shorts: SL must be <= entry.
+// Called once when Rung 1 fires. Prevents a full reversal eating
+// profit that the ladder already captured via partial close.
+void MoveStopsToBreakeven(int direction)
+{
+   int cnt = PositionsTotal();
+   for(int i = 0; i < cnt; i++)
+   {
+      ulong ticket = PositionGetTicket(i);
+      if(!PositionSelectByTicket(ticket)) continue;
+      if(PositionGetString(POSITION_SYMBOL) != _Symbol)   continue;
+      if(PositionGetInteger(POSITION_MAGIC)  != InpMagic) continue;
+      long type = PositionGetInteger(POSITION_TYPE);
+      if((type == POSITION_TYPE_BUY ? 1 : -1) != direction) continue;
+
+      double entry     = PositionGetDouble(POSITION_PRICE_OPEN);
+      double currentSL = PositionGetDouble(POSITION_SL);
+      double currentTP = PositionGetDouble(POSITION_TP);
+      bool   needsMove = false;
+
+      if(direction > 0 && currentSL < entry)  needsMove = true; // long SL below entry
+      if(direction < 0 && (currentSL == 0.0 || currentSL > entry)) needsMove = true; // short SL above entry
+
+      if(needsMove)
+      {
+         MqlTradeRequest req; MqlTradeResult res;
+         ZeroMemory(req); ZeroMemory(res);
+         req.action   = TRADE_ACTION_SLTP;
+         req.symbol   = _Symbol;
+         req.position = ticket;
+         req.sl       = entry;
+         req.tp       = currentTP;
+         if(!OrderSend(req, res))
+            Print("SYM BE move failed ticket=",ticket," err=",GetLastError());
+         else
+            Print("SYM BE moved stop to entry=",DoubleToString(entry,2)," ticket=",ticket);
+      }
+   }
+}
+
+// Trail stops every bar after Rung 2 fires.
+// For longs:  newSL = entry + (bid - entry) * InpTrailLockPct/100
+//             only moves stop UP, never down.
+// For shorts: newSL = entry - (entry - ask) * InpTrailLockPct/100
+//             only moves stop DOWN, never up.
+void TrailStops(int direction)
+{
+   double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+   double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+   double lotStep = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
+
+   int cnt = PositionsTotal();
+   for(int i = 0; i < cnt; i++)
+   {
+      ulong ticket = PositionGetTicket(i);
+      if(!PositionSelectByTicket(ticket)) continue;
+      if(PositionGetString(POSITION_SYMBOL) != _Symbol)   continue;
+      if(PositionGetInteger(POSITION_MAGIC)  != InpMagic) continue;
+      long type = PositionGetInteger(POSITION_TYPE);
+      if((type == POSITION_TYPE_BUY ? 1 : -1) != direction) continue;
+
+      double entry     = PositionGetDouble(POSITION_PRICE_OPEN);
+      double currentSL = PositionGetDouble(POSITION_SL);
+      double currentTP = PositionGetDouble(POSITION_TP);
+      double newSL     = currentSL;
+      bool   needsMove = false;
+
+      if(direction > 0)
+      {
+         double locked = entry + (bid - entry) * InpTrailLockPct / 100.0;
+         if(locked > currentSL && locked > entry) { newSL = locked; needsMove = true; }
+      }
+      else
+      {
+         double locked = entry - (entry - ask) * InpTrailLockPct / 100.0;
+         if((currentSL == 0.0 || locked < currentSL) && locked < entry) { newSL = locked; needsMove = true; }
+      }
+
+      if(needsMove)
+      {
+         MqlTradeRequest req; MqlTradeResult res;
+         ZeroMemory(req); ZeroMemory(res);
+         req.action   = TRADE_ACTION_SLTP;
+         req.symbol   = _Symbol;
+         req.position = ticket;
+         req.sl       = NormalizeDouble(newSL, (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS));
+         req.tp       = currentTP;
+         OrderSend(req, res); // silent — trail runs every bar, no spam print
+      }
+   }
+}
+
+// Run stop protection every bar for both directions.
+void RunStopProtection()
+{
+   if(g_longBEActive  && !g_longTrailActive)  MoveStopsToBreakeven(1);
+   if(g_shortBEActive && !g_shortTrailActive) MoveStopsToBreakeven(-1);
+   if(g_longTrailActive)  TrailStops(1);
+   if(g_shortTrailActive) TrailStops(-1);
+}
+
 
 //==================================================================
 // 13. PROFIT LADDER
@@ -739,11 +881,17 @@ void RunProfitLadderDirection(int direction, int &rungs)
       posCount++;
    }
 
-   // Reset rung counter when no positions open - new campaign can start fresh
-   if(posCount == 0) { rungs = 0; return; }
+   // Reset everything when campaign fully closes
+   if(posCount == 0)
+   {
+      rungs = 0;
+      if(direction > 0) { g_longBEActive = false;  g_longTrailActive  = false; }
+      else              { g_shortBEActive = false; g_shortTrailActive = false; }
+      return;
+   }
    if(totalRisk <= 0.0) return;
 
-   double ratio = totalPnL / totalRisk;
+   double ratio  = totalPnL / totalRisk;
    string dirStr = (direction > 0) ? "LONG" : "SHORT";
 
    // Fire at most one rung per bar per direction
@@ -754,6 +902,10 @@ void RunProfitLadderDirection(int direction, int &rungs)
             " closing=",DoubleToString(closeL,2)," lots");
       CloseOldestLots(direction, closeL, "SYM LADDER R1");
       rungs = 1;
+      // Rung 1: move all remaining stops to breakeven immediately
+      if(direction > 0) g_longBEActive  = true;
+      else              g_shortBEActive = true;
+      MoveStopsToBreakeven(direction);
    }
    else if(rungs == 1 && ratio >= InpLadderRung2)
    {
@@ -762,6 +914,9 @@ void RunProfitLadderDirection(int direction, int &rungs)
             " closing=",DoubleToString(closeL,2)," lots");
       CloseOldestLots(direction, closeL, "SYM LADDER R2");
       rungs = 2;
+      // Rung 2: activate trailing — locks InpTrailLockPct of move each bar
+      if(direction > 0) { g_longBEActive = false;  g_longTrailActive  = true; }
+      else              { g_shortBEActive = false; g_shortTrailActive = true; }
    }
    else if(rungs == 2 && ratio >= InpLadderRung3)
    {
@@ -770,6 +925,7 @@ void RunProfitLadderDirection(int direction, int &rungs)
             " closing=",DoubleToString(closeL,2)," lots");
       CloseOldestLots(direction, closeL, "SYM LADDER R3");
       rungs = 3;
+      // Rung 3: trail stays active on the final runner
    }
 }
 
@@ -837,6 +993,16 @@ void ExecuteTrading()
    bool S4 = (g_mode == -1 && g_phaseShort == 4);
    double impL = g_anchorHigh - g_anchorLow;
    double impS = g_anchorHigh - g_anchorLow;
+
+   // Counter-direction block:
+   // Do not open longs while the short book is net profitable, and vice versa.
+   // A counter-trend bounce inside a running profitable campaign is not a
+   // new campaign — it is noise. Opening against a profitable book destroys
+   // net P&L even when both sides eventually work.
+   bool shortBookProfitable = (GetDirectionFloatingPnL(-1) > 0.0);
+   bool longBookProfitable  = (GetDirectionFloatingPnL( 1) > 0.0);
+   if(shortBookProfitable) { L3 = false; L4 = false; }
+   if(longBookProfitable)  { S3 = false; S4 = false; }
 
    // --- LONG P3 ---
    if(L3 && g_lastLongTradeTime != barTime)
@@ -1049,6 +1215,8 @@ int OnInit()
 
    // Profit ladder state
    g_longRungs  = 0; g_shortRungs = 0;
+   g_longBEActive = false;  g_shortBEActive = false;
+   g_longTrailActive = false; g_shortTrailActive = false;
 
    // Kill switch
    g_equityHighWater = AccountInfoDouble(ACCOUNT_EQUITY);
@@ -1082,7 +1250,12 @@ void OnTick()
    // 3. Emergency kill switch — if fired, skip all other logic this bar
    if(CheckKillSwitch()) return;
 
-   // 4. Autonomous profit ladder — fires every bar from live PnL
+   // 4. Stop protection every bar:
+   //    - Breakeven moves after Rung 1 (g_longBEActive / g_shortBEActive)
+   //    - Trailing stops after Rung 2  (g_longTrailActive / g_shortTrailActive)
+   RunStopProtection();
+
+   // 5. Autonomous profit ladder — fires every bar from live PnL
    //    Runs BEFORE the ARC exit so partials are captured first;
    //    the ARC exit then flattens whatever runner remains.
    RunProfitLadder();
