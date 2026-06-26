@@ -88,8 +88,8 @@ input bool   InpBlockNewIfBreach  = true;   // Block new entries only on HARD ca
 //==================================================================
 input int    InpMinBarsBeforeTrim = 3;      // Position age gate: min bars open before a leg is trimmable
 input double InpMinAdverseRToTrim = 0.50;   // Adverse excursion (R) that lets a YOUNG leg be trimmed early
-input double InpMaxLegRiskMult    = 3.0;    // Micro-bomb: leg risk-to-SL > this * intended per-trade risk
-input double InpCampaignVarMult   = 1.0;    // Scale on campaign VaR limits (>1 = more room for pyramiding)
+input double InpMaxLegRiskMult    = 5.0;    // Micro-bomb: leg risk-to-SL > this * intended per-trade risk
+input double InpCampaignVarMult   = 3.0;    // Scale on campaign VaR limits (>1 = more room for pyramiding)
 input double InpHardBreachMult    = 2.0;    // Per-campaign overage ratio that blocks new entries
 input double InpPortfolioVarMult  = 3.0;    // Portfolio gross-VaR hard breach (x base v3 limit, ALL campaigns)
 input double InpLiqLookbackBars   = 120;    // Lookback for dynamic liquidity / swing levels
@@ -949,10 +949,21 @@ void RE_BuildScenarios(RE_Market &m, RE_Config &cfg, double &scen[], int &scCoun
 
 double RE_ScenarioPnL(RE_Position &pos[], int posCount, double scenPrice)
 {
+   // Cap each position's exit at its SL so VaR respects protective stops.
+   // Without this, a long at 1873 with SL trailed to 1874.31 (in profit)
+   // shows a catastrophic -$4,225 VaR on adverse scenarios when the actual
+   // worst case is +$725 (stopped out in profit at the SL). The false VaR
+   // caused trims on positions that had zero financial risk.
    double tot=0;
    for(int i=0;i<posCount;i++)
    {
-      double move       = scenPrice - pos[i].entry;
+      double exitPrice = scenPrice;
+      if(pos[i].sl > 0.0)
+      {
+         if(pos[i].direction > 0 && scenPrice < pos[i].sl) exitPrice = pos[i].sl;
+         if(pos[i].direction < 0 && scenPrice > pos[i].sl) exitPrice = pos[i].sl;
+      }
+      double move       = exitPrice - pos[i].entry;
       double signedMove = (pos[i].direction<0 ? -move : move);
       tot += signedMove * RE_LotValue(pos[i].lots);
    }
@@ -1684,6 +1695,17 @@ void RE_ProcessCampaign(RE_RiskMode mode,
 
       // ---- 2) GRADUATED VaR INTERVENTION ----
       if(level <= 1) break;                          // campaign within limits
+
+      // CAMPAIGN-PROFIT GUARD: if the campaign is collectively profitable and
+      // every leg either has its SL above breakeven (zero downside) or is
+      // still young/protected, the risk engine has nothing to correct.
+      // Let the profit-protection manager (peak-giveback ratchet + partials)
+      // handle the exits instead — it is purpose-built for that.
+      bool anyUnprotected = false;
+      for(int i=0;i<mCount;i++) if(!met[i].isProtected) { anyUnprotected=true; break; }
+      double campPnL = 0.0;
+      for(int i=0;i<posCount;i++) campPnL += pos[i].pnl;
+      if(campPnL >= 0.0 && !anyUnprotected) break;  // all winning & protected -> hands off
 
       int idx = RE_SelectTrimIndex(met,mCount,cfg,level);
       if(idx < 0) break;                             // only protected legs left -> let them run
