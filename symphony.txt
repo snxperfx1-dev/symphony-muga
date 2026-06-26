@@ -1,9 +1,10 @@
 //+------------------------------------------------------------------+
-//| SYMPHONY_Physics_Engine_Elite_Max_Phase34_DRDWCT_v1_8.mq5       |
-//| Phase Engine (curvature-based) + DRDWCT v1.8 Risk Engine        |
+//| SYMPHONY_Physics_Engine_Elite_Max_Phase34_DRDWCT_v1_9.mq5       |
+//| Phase Engine (curvature-based) + DRDWCT v1.9 Risk Engine        |
 //| Risk engine v3: MULTI-CAMPAIGN (long & short books at once),    |
-//|   per-direction gross risk (no netting) + portfolio backstop,   |
-//|   age/quality aware, graduated intervention, trailing exits     |
+//|   per-direction gross risk (no netting) + portfolio backstop.   |
+//| Exits v2: peak-giveback ratchet + ATR-distance partials +       |
+//|   aggressive trail on the two most-profitable legs.             |
 //| Entries: Phase 3 + Phase 4 only (long & short)                  |
 //| TP: ARC + institutional sweep + phase-change composite exit     |
 //| MT5 HEDGING VERSION - RAW MqlTradeRequest (IOC)                 |
@@ -105,6 +106,24 @@ input double InpTrailStartAtr     = 1.5;    // Start trailing after this favorab
 input double InpTrailDistAtr      = 1.5;    // Trailing distance kept behind price (ATR)
 input bool   InpExitOnFlip        = false;  // Close a leg on opposite impulse (WARNING: disables multi-campaign)
 input bool   InpUseArcTP          = false;  // Place a hard TP at the ARC extension target on entry
+
+//==================================================================
+// 2D. INPUTS - AGGRESSIVE PROFIT CAPTURE (giveback ratchet + partials)
+//==================================================================
+// Fixes the give-back problem: a leg up ~$3k must not collapse to ~$300.
+// Giveback ratchet locks a % of the PEAK profit (ratchets up, never loosens),
+// the two most-profitable legs lock even more, and partials bank cash as the
+// move extends from entry.
+input bool   InpUseGivebackTrail  = true;   // Lock a % of PEAK profit reached (ratchets up)
+input double InpGivebackTrigAtr   = 0.8;    // Peak favorable (ATR) before giveback lock engages
+input double InpGivebackLock      = 0.55;   // Normal legs: fraction of peak profit locked
+input double InpGivebackLockTop   = 0.78;   // Top-N biggest winners: lock more (trail tighter)
+input int    InpAggTrailTopN      = 2;      // Number of most-profitable legs trailed aggressively
+
+input bool   InpUsePartials       = true;   // Scale out as price extends from entry
+input double InpPartialStepAtr    = 1.0;    // Take a partial each +this much favorable move (ATR)
+input double InpPartialPct        = 0.25;   // Fraction of current lots closed per partial step
+input int    InpPartialMaxSteps   = 3;      // Max partials per position
 
 // Timing - target session timezone (GMT baseline)
 input int    InpTargetGMT         = 0;      // Target session timezone (GMT offset)
@@ -304,6 +323,15 @@ RE_ModelState  g_reModelState;
 RE_BottomLayer g_reBottom;
 bool           g_reBottomInit = false;
 bool           g_lastRiskOk   = true;
+
+//==================================================================
+// 4B. PROFIT-CAPTURE REGISTRY (per-ticket peak favorable + partials taken)
+//==================================================================
+#define PC_MAX 256
+long   g_pcTicket[PC_MAX];
+double g_pcPeakFav[PC_MAX];
+int    g_pcPartials[PC_MAX];
+int    g_pcCount = 0;
 
 //==================================================================
 // 5. BASIC HELPERS
@@ -1968,92 +1996,156 @@ void ManageArcInstitutionalExits()
 }
 
 //==================================================================
-// 16B. PROFIT PROTECTION - BREAKEVEN + ATR TRAILING + FLIP EXIT
-//      Runs every bar for every EA position, INDEPENDENT of g_mode,
-//      so winners are protected/booked even after the impulse that
-//      created them has reset or flipped (the old orphan problem).
+// 16B. PROFIT PROTECTION - GIVEBACK RATCHET + PARTIALS + TOP-N AGGRESSIVE
+//      Runs every bar for every EA position, INDEPENDENT of g_mode.
+//      Locks a % of PEAK profit (so a +$3k leg can't collapse to +$300),
+//      scales out as price extends, and trails the two biggest winners
+//      tighter. Works across multiple simultaneous campaigns.
 //==================================================================
+int PC_Index(long ticket)
+{
+   for(int i=0;i<g_pcCount;i++) if(g_pcTicket[i]==ticket) return i;
+   if(g_pcCount<PC_MAX)
+   {
+      g_pcTicket[g_pcCount]=ticket; g_pcPeakFav[g_pcCount]=0.0; g_pcPartials[g_pcCount]=0;
+      return g_pcCount++;
+   }
+   return -1;
+}
+
+void PC_Prune()
+{
+   int w=0;
+   for(int i=0;i<g_pcCount;i++)
+   {
+      if(PositionSelectByTicket((ulong)g_pcTicket[i]) &&
+         PositionGetString(POSITION_SYMBOL)==_Symbol &&
+         PositionGetInteger(POSITION_MAGIC)==InpMagic)
+      {
+         g_pcTicket[w]=g_pcTicket[i]; g_pcPeakFav[w]=g_pcPeakFav[i]; g_pcPartials[w]=g_pcPartials[i]; w++;
+      }
+   }
+   g_pcCount=w;
+}
+
 void ManageProfitProtection()
 {
-   if(!InpUseTrailing && !InpExitOnFlip) return;
+   if(!InpUseTrailing && !InpExitOnFlip && !InpUseGivebackTrail && !InpUsePartials){ PC_Prune(); return; }
 
    double atr = GetATR(1);
-   if(atr <= 0.0) return;
+   if(atr <= 0.0){ PC_Prune(); return; }
 
    double bid = SymbolInfoDouble(_Symbol,SYMBOL_BID);
    double ask = SymbolInfoDouble(_Symbol,SYMBOL_ASK);
    long   stopsLvl = SymbolInfoInteger(_Symbol,SYMBOL_TRADE_STOPS_LEVEL);
    double minDist  = stopsLvl * _Point;
+   double minLot   = SymbolInfoDouble(_Symbol,SYMBOL_VOLUME_MIN);
 
+   // ---- gather EA positions ----
+   ulong  tk[256]; int dr[256]; double ent[256]; double prof[256]; int cnt=0;
    int total = PositionsTotal();
-   for(int i = total-1; i >= 0; i--)
+   for(int i=0;i<total && cnt<256;i++)
    {
       ulong ticket = PositionGetTicket(i);
       if(!PositionSelectByTicket(ticket)) continue;
-      if(PositionGetString(POSITION_SYMBOL) != _Symbol) continue;
-      if(PositionGetInteger(POSITION_MAGIC) != InpMagic) continue;
+      if(PositionGetString(POSITION_SYMBOL)!=_Symbol) continue;
+      if(PositionGetInteger(POSITION_MAGIC)!=InpMagic) continue;
+      tk[cnt]  = ticket;
+      dr[cnt]  = (PositionGetInteger(POSITION_TYPE)==POSITION_TYPE_BUY ? 1 : -1);
+      ent[cnt] = PositionGetDouble(POSITION_PRICE_OPEN);
+      prof[cnt]= PositionGetDouble(POSITION_PROFIT);
+      cnt++;
+   }
+   if(cnt==0){ PC_Prune(); return; }
 
-      long   type  = PositionGetInteger(POSITION_TYPE);
-      double entry = PositionGetDouble(POSITION_PRICE_OPEN);
+   // ---- rank by profit (desc) -> mark the top-N most profitable as aggressive ----
+   int order[256]; for(int i=0;i<cnt;i++) order[i]=i;
+   for(int i=0;i<cnt-1;i++)
+      for(int j=i+1;j<cnt;j++)
+         if(prof[order[j]] > prof[order[i]]) { int t=order[i]; order[i]=order[j]; order[j]=t; }
+   bool aggressive[256]; for(int i=0;i<cnt;i++) aggressive[i]=false;
+   for(int k=0;k<InpAggTrailTopN && k<cnt;k++)
+      if(prof[order[k]] > 0.0) aggressive[order[k]]=true;   // only protect winners aggressively
+
+   // ---- manage each position ----
+   for(int i=0;i<cnt;i++)
+   {
+      ulong ticket = tk[i];
+      if(!PositionSelectByTicket(ticket)) continue;
+      int    d     = dr[i];
+      double entry = ent[i];
       double curSL = PositionGetDouble(POSITION_SL);
+      double lots  = PositionGetDouble(POSITION_VOLUME);
 
-      if(type == POSITION_TYPE_BUY)
+      // flip exit (off by default; would disable multi-campaign)
+      if(InpExitOnFlip && ((d==1 && g_mode==-1) || (d==-1 && g_mode==1)))
+      { ClosePositionFull(ticket); continue; }
+
+      double curFav = (d==1 ? bid-entry : entry-ask);
+      int ri = PC_Index((long)ticket);
+      double peakFav = curFav;
+      if(ri>=0)
       {
-         // Flip exit: a genuine fresh down-impulse has formed against the long.
-         if(InpExitOnFlip && g_mode == -1)
-         {
-            ClosePositionFull(ticket);
-            continue;
-         }
-         if(!InpUseTrailing) continue;
-
-         double fav   = bid - entry;       // favorable move (long)
-         double newSL = curSL;
-
-         if(fav >= InpBETriggerAtr * atr)
-         {
-            double be = entry + InpBELockAtr * atr;
-            if(be > newSL) newSL = be;
-         }
-         if(fav >= InpTrailStartAtr * atr)
-         {
-            double tsl = bid - InpTrailDistAtr * atr;
-            if(tsl > newSL) newSL = tsl;
-         }
-
-         // Only ever tighten, and keep a legal distance below price.
-         if(newSL > curSL && newSL <= bid - minDist)
-            ModifyPositionSL(ticket, newSL);
+         if(curFav > g_pcPeakFav[ri]) g_pcPeakFav[ri]=curFav;
+         peakFav = g_pcPeakFav[ri];
       }
-      else // POSITION_TYPE_SELL
+
+      // ---- partials: scale out each +InpPartialStepAtr of favorable move ----
+      if(InpUsePartials && ri>=0 && g_pcPartials[ri] < InpPartialMaxSteps)
       {
-         if(InpExitOnFlip && g_mode == 1)
+         double need = (g_pcPartials[ri]+1) * InpPartialStepAtr * atr;
+         if(curFav >= need)
          {
-            ClosePositionFull(ticket);
-            continue;
+            double cut = NormalizeDouble(lots*InpPartialPct,2);
+            if(cut >= minLot && lots-cut >= minLot)
+            {
+               if(ClosePositionPartial(ticket,cut)) g_pcPartials[ri]++;
+            }
+            else
+            {
+               g_pcPartials[ri] = InpPartialMaxSteps; // remaining too small to scale further
+            }
          }
-         if(!InpUseTrailing) continue;
+      }
 
-         double fav   = entry - ask;       // favorable move (short)
-         double newSL = curSL;
-         bool   noSL  = (curSL <= 0.0);
+      // refresh after a possible partial
+      if(!PositionSelectByTicket(ticket)) continue;
+      curSL = PositionGetDouble(POSITION_SL);
 
-         if(fav >= InpBETriggerAtr * atr)
+      // ---- stop placement ----
+      double newSL = curSL;
+      if(InpUseGivebackTrail && peakFav >= InpGivebackTrigAtr*atr)
+      {
+         double lockFrac = aggressive[i] ? InpGivebackLockTop : InpGivebackLock;
+         double cand = entry + d * lockFrac * peakFav;   // lock a % of the best profit seen
+         if((cand - newSL)*d > 0) newSL = cand;
+      }
+      else if(InpUseTrailing)
+      {
+         if(curFav >= InpBETriggerAtr*atr)
          {
-            double be = entry - InpBELockAtr * atr;
-            if(noSL || be < newSL) newSL = be;
+            double be = entry + d*InpBELockAtr*atr;
+            if((be-newSL)*d > 0) newSL = be;
          }
-         if(fav >= InpTrailStartAtr * atr)
+         if(curFav >= InpTrailStartAtr*atr)
          {
-            double tsl = ask + InpTrailDistAtr * atr;
-            if(noSL || tsl < newSL) newSL = tsl;
+            double tsl = (d==1?bid:ask) - d*InpTrailDistAtr*atr;
+            if((tsl-newSL)*d > 0) newSL = tsl;
          }
+      }
 
-         // Only ever tighten (lower SL for a short), keep a legal distance above price.
-         if((noSL || newSL < curSL) && newSL >= ask + minDist)
-            ModifyPositionSL(ticket, newSL);
+      // apply: tighten only, keep a legal distance from price
+      if(d==1)
+      {
+         if(newSL > curSL && newSL <= bid - minDist) ModifyPositionSL(ticket,newSL);
+      }
+      else
+      {
+         if((curSL<=0.0 || newSL < curSL) && newSL >= ask + minDist) ModifyPositionSL(ticket,newSL);
       }
    }
+
+   PC_Prune();
 }
 
 //==================================================================
@@ -2098,6 +2190,8 @@ int OnInit()
    g_lastLongTradeTime  = 0;
    g_lastShortTradeTime = 0;
 
+   g_pcCount            = 0;
+
    double eq = AccountInfoDouble(ACCOUNT_EQUITY);
    RE_BuildDefaultConfig(eq,g_reConfig);
    g_reModelState.hasWeights = false;
@@ -2107,7 +2201,7 @@ int OnInit()
    if(!RefreshSeries())
       return(INIT_FAILED);
 
-   Print("SYMPHONY Elite Max - Phase 3+4 + DRDWCT v1.8 (multi-campaign risk) + ARC v2 (MT5 RAW, IOC, time-gated) loaded.");
+   Print("SYMPHONY Elite Max - Phase 3+4 + DRDWCT v1.9 (multi-campaign risk + giveback/partial exits) loaded.");
    return(INIT_SUCCEEDED);
 }
 
