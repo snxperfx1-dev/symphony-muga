@@ -100,12 +100,7 @@ input double InpLadderFrac3       = 0.25;   // Lot fraction to close at rung 3
 input double InpTrailLockPct      = 50.0;   // % of price move to lock after rung 2
 
 //==================================================================
-// 1F. KILL SWITCH
-//==================================================================
-input double InpKillSwitchPct     = 10.0;   // Max equity drawdown from high-water (%)
-
-//==================================================================
-// 1G. TIMING
+// 1F. TIMING
 //==================================================================
 input int    InpTargetGMT         = 0;      // Session GMT offset
 
@@ -187,10 +182,9 @@ bool     g_longTrailActive   = false; // trail long stops
 bool     g_shortTrailActive  = false; // trail short stops
 
 //==================================================================
-// 5. GLOBAL STATE - KILL SWITCH
+// 5. GLOBAL STATE - KILL SWITCH (removed)
 //==================================================================
-double   g_equityHighWater   = 0.0;
-bool     g_killSwitchFired   = false; // set once on first trigger, cleared on recovery
+double   g_equityHighWater   = 0.0; // retained for reference only
 
 
 //==================================================================
@@ -971,47 +965,9 @@ void RunProfitLadder()
 // below the high-water, close all positions and return true.
 // Caller (OnTick) skips remaining logic if kill fires.
 //==================================================================
-bool CheckKillSwitch()
-{
-   double equity = AccountInfoDouble(ACCOUNT_EQUITY);
-   if(equity > g_equityHighWater) g_equityHighWater = equity;
-   if(g_equityHighWater <= 0.0) return false;
-
-   double drawdownPct = (g_equityHighWater - equity) / g_equityHighWater * 100.0;
-
-   // Recovery: clear the flag so the EA can trade again if equity recovers
-   if(drawdownPct < InpKillSwitchPct)
-   {
-      if(g_killSwitchFired)
-      {
-         Print("SYM KILL SWITCH cleared: equity=",DoubleToString(equity,2),
-               " drawdown=",DoubleToString(drawdownPct,1),"% < threshold");
-         g_killSwitchFired = false;
-      }
-      return false;
-   }
-
-   // Still in drawdown — if already fired, block entries silently, no repeat print/close
-   if(g_killSwitchFired) return true;
-
-   // First time crossing threshold: print, close all, set flag
-   Print("SYM KILL SWITCH fired: equity=",DoubleToString(equity,2),
-         " highWater=",DoubleToString(g_equityHighWater,2),
-         " drawdown=",DoubleToString(drawdownPct,1),"%");
-
-   int total = PositionsTotal();
-   for(int i = total - 1; i >= 0; i--)
-   {
-      ulong ticket = PositionGetTicket(i);
-      if(!PositionSelectByTicket(ticket)) continue;
-      if(PositionGetString(POSITION_SYMBOL) != _Symbol)   continue;
-      if(PositionGetInteger(POSITION_MAGIC)  != InpMagic) continue;
-      ClosePositionFull(ticket, "SYM KILL SWITCH");
-   }
-
-   g_killSwitchFired = true;
-   return true;
-}
+// Kill switch removed — equity drawdown measured from floating high-water
+// is not a real balance drawdown. Profit ladder + trailing stops are the
+// correct mechanism for protecting captured gains.
 
 //==================================================================
 // 15. TRADING EXECUTION
@@ -1263,9 +1219,8 @@ int OnInit()
    g_longBEActive = false;  g_shortBEActive = false;
    g_longTrailActive = false; g_shortTrailActive = false;
 
-   // Kill switch
-   g_equityHighWater  = AccountInfoDouble(ACCOUNT_EQUITY);
-   g_killSwitchFired  = false;
+   // Kill switch removed
+   g_equityHighWater = AccountInfoDouble(ACCOUNT_EQUITY);
 
    if(!RefreshSeries()) return INIT_FAILED;
 
@@ -1293,17 +1248,8 @@ void OnTick()
    // 2. Update ARC target
    UpdateARC();
 
-   // 3. Emergency kill switch — if fired, skip all other logic this bar
-   if(CheckKillSwitch()) return;
-
-   // 4. Stop protection every bar:
-   //    - Breakeven moves after Rung 1 (g_longBEActive / g_shortBEActive)
-   //    - Trailing stops after Rung 2  (g_longTrailActive / g_shortTrailActive)
+   // 3. Profit ladder and trailing stop protection
    RunStopProtection();
-
-   // 5. Autonomous profit ladder — fires every bar from live PnL
-   //    Runs BEFORE the ARC exit so partials are captured first;
-   //    the ARC exit then flattens whatever runner remains.
    RunProfitLadder();
 
    // 5. ARC + institutional + phase/invalidation composite exit
