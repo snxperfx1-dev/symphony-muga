@@ -124,15 +124,13 @@ input int    InpPreNYStart        = 840;    // 14:00 server
 input int    InpPreNYEnd          = 895;    // 14:55 server
 
 //==================================================================
-// 1H. R-1 HIGHER-TF TREND GATE ON SHORTS
-// Audit: counter-trend shorts bleed (-45.7R, -0.29R avg, 35% WR, n=159).
-// Block short entries unless the higher timeframe is in a downtrend
-// (price below the HTF EMA). Longs are unaffected (they profit in
-// both trend states in this instrument).
+// 1H. HIGHER-TF TREND (audit classification only)
+// The HTF short-trend gate (R-1) was removed. HTFTrend() is retained
+// purely to tag each trade's HTF trend state in the audit log so
+// per-trend expectancy can be measured from the journal.
 //==================================================================
-input bool            InpHTFShortGate  = true;        // Gate shorts by HTF trend
-input ENUM_TIMEFRAMES InpHTFTimeframe  = PERIOD_D1;   // Higher timeframe
-input int             InpHTFEMAPeriod  = 50;          // HTF EMA period
+input ENUM_TIMEFRAMES InpHTFTimeframe  = PERIOD_D1;   // Higher timeframe (audit)
+input int             InpHTFEMAPeriod  = 50;          // HTF EMA period (audit)
 
 //==================================================================
 // 1I. VOLATILITY REGIME (audit classification only)
@@ -1059,8 +1057,9 @@ void RunProfitLadder()
 }
 
 //==================================================================
-// 13C. R-1 HIGHER-TF TREND (for short gate)
+// 13C. HIGHER-TF TREND (audit tag only - gate removed)
 // Returns +1 uptrend (price >= HTF EMA), -1 downtrend, 0 unknown.
+// Used only to label trades in the audit log; no longer gates entries.
 //==================================================================
 int HTFTrend()
 {
@@ -1263,9 +1262,6 @@ void ExecuteTrading()
    bool longBookOpen  = (GetDirectionPositionCount( 1) > 0);
    if(shortBookOpen) { L3 = false; L4 = false; }
    if(longBookOpen)  { S3 = false; S4 = false; }
-
-   // R-1: HTF trend gate on shorts. Block shorts unless HTF is down.
-   if(InpHTFShortGate && HTFTrend() >= 0) { S3=false; S4=false; }
 
    // --- LONG P3 ---
    if(L3 && g_lastLongTradeTime != barTime)
