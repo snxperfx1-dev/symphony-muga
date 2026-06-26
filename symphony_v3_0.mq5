@@ -129,6 +129,27 @@ input bool   InpBlockPreNY        = true;   // Block 14:00-14:55 pre-NY lull
 input int    InpPreNYStart        = 840;    // 14:00
 input int    InpPreNYEnd          = 895;    // 14:55
 
+//==================================================================
+// 1H. R-1 HIGHER-TF TREND GATE ON SHORTS
+// Audit: counter-trend shorts bleed (-45.7R, -0.29R avg, 35% WR, n=159).
+// Block short entries unless the higher timeframe is in a downtrend
+// (price below the HTF EMA). Longs are unaffected (they profit in
+// both trend states in this instrument).
+//==================================================================
+input bool            InpHTFShortGate  = true;        // Gate shorts by HTF trend
+input ENUM_TIMEFRAMES InpHTFTimeframe  = PERIOD_D1;   // Higher timeframe
+input int             InpHTFEMAPeriod  = 50;          // HTF EMA period
+
+//==================================================================
+// 1I. R-2 VOLATILITY-REGIME FILTER
+// Audit: high-ATR entries net negative (-44.5R, -0.17R avg), monotonic.
+// Suppress ALL new entries when current ATR ranks in the top
+// InpVolBlockPctile of its recent distribution (expansion/whipsaw).
+//==================================================================
+input bool   InpVolFilter         = true;   // Suppress entries in high-ATR state
+input int    InpVolLookback        = 100;    // Bars for ATR percentile ranking
+input double InpVolBlockPctile     = 0.66;   // Block if ATR rank >= this percentile
+
 
 //==================================================================
 // 2. GLOBAL STATE - PHASE ENGINE
@@ -1094,6 +1115,53 @@ int LondonOpenBias()
    return 0;                                     // neither swept -> block London open
 }
 
+//==================================================================
+// 13C. R-1 HIGHER-TF TREND (for short gate)
+// Returns +1 uptrend (price >= HTF EMA), -1 downtrend, 0 unknown.
+//==================================================================
+int HTFTrend()
+{
+   static int hEMA = INVALID_HANDLE;
+   if(hEMA == INVALID_HANDLE)
+   {
+      hEMA = iMA(_Symbol, InpHTFTimeframe, InpHTFEMAPeriod, 0, MODE_EMA, PRICE_CLOSE);
+      if(hEMA == INVALID_HANDLE) return 0;
+   }
+   double buf[];
+   ArraySetAsSeries(buf, true);
+   if(CopyBuffer(hEMA, 0, 0, 1, buf) < 1) return 0;
+   double ema = buf[0];
+   if(ema <= 0.0) return 0;
+   double px = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+   return (px >= ema) ? 1 : -1;
+}
+
+//==================================================================
+// 13D. R-2 VOLATILITY REGIME
+// True if current ATR ranks at/above InpVolBlockPctile within the
+// last InpVolLookback bars (high-volatility / expansion state).
+//==================================================================
+bool IsHighVol()
+{
+   static int hATRv = INVALID_HANDLE;
+   if(hATRv == INVALID_HANDLE)
+   {
+      hATRv = iATR(_Symbol, _Period, InpATRLen);
+      if(hATRv == INVALID_HANDLE) return false;
+   }
+   int n = InpVolLookback;
+   if(n < 20) n = 20;
+   double buf[];
+   ArraySetAsSeries(buf, true);
+   if(CopyBuffer(hATRv, 0, 1, n, buf) < n) return false;
+   double cur = buf[0];
+   int below = 0;
+   for(int i = 0; i < n; i++)
+      if(buf[i] < cur) below++;
+   double rank = (double)below / (double)n;   // 0..1 percentile of current ATR
+   return (rank >= InpVolBlockPctile);
+}
+
 
 //==================================================================
 // 14. EQUITY KILL SWITCH - REMOVED
@@ -1145,6 +1213,12 @@ void ExecuteTrading()
    if(loBias == 0)       { L3=false; L4=false; S3=false; S4=false; }
    else if(loBias == 1)  { S3=false; S4=false; }   // buys only
    else if(loBias == -1) { L3=false; L4=false; }   // sells only
+
+   // R-1: HTF trend gate on shorts. Block shorts unless HTF is down.
+   if(InpHTFShortGate && HTFTrend() >= 0) { S3=false; S4=false; }
+
+   // R-2: volatility-regime filter. Suppress ALL entries in high-ATR state.
+   if(InpVolFilter && IsHighVol()) { L3=false; L4=false; S3=false; S4=false; }
 
    // --- LONG P3 ---
    if(L3 && g_lastLongTradeTime != barTime)
