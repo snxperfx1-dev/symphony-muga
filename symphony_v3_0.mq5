@@ -190,6 +190,7 @@ bool     g_shortTrailActive  = false; // trail short stops
 // 5. GLOBAL STATE - KILL SWITCH
 //==================================================================
 double   g_equityHighWater   = 0.0;
+bool     g_killSwitchFired   = false; // set once on first trigger, cleared on recovery
 
 
 //==================================================================
@@ -977,13 +978,27 @@ bool CheckKillSwitch()
    if(g_equityHighWater <= 0.0) return false;
 
    double drawdownPct = (g_equityHighWater - equity) / g_equityHighWater * 100.0;
-   if(drawdownPct < InpKillSwitchPct) return false;
 
-   Print("SYM KILL SWITCH fired: equity=", DoubleToString(equity,2),
-         " highWater=", DoubleToString(g_equityHighWater,2),
-         " drawdown=",  DoubleToString(drawdownPct,1),"%");
+   // Recovery: clear the flag so the EA can trade again if equity recovers
+   if(drawdownPct < InpKillSwitchPct)
+   {
+      if(g_killSwitchFired)
+      {
+         Print("SYM KILL SWITCH cleared: equity=",DoubleToString(equity,2),
+               " drawdown=",DoubleToString(drawdownPct,1),"% < threshold");
+         g_killSwitchFired = false;
+      }
+      return false;
+   }
 
-   // Close all positions for this EA on this symbol, reverse iterate
+   // Still in drawdown — if already fired, block entries silently, no repeat print/close
+   if(g_killSwitchFired) return true;
+
+   // First time crossing threshold: print, close all, set flag
+   Print("SYM KILL SWITCH fired: equity=",DoubleToString(equity,2),
+         " highWater=",DoubleToString(g_equityHighWater,2),
+         " drawdown=",DoubleToString(drawdownPct,1),"%");
+
    int total = PositionsTotal();
    for(int i = total - 1; i >= 0; i--)
    {
@@ -993,6 +1008,8 @@ bool CheckKillSwitch()
       if(PositionGetInteger(POSITION_MAGIC)  != InpMagic) continue;
       ClosePositionFull(ticket, "SYM KILL SWITCH");
    }
+
+   g_killSwitchFired = true;
    return true;
 }
 
@@ -1247,7 +1264,8 @@ int OnInit()
    g_longTrailActive = false; g_shortTrailActive = false;
 
    // Kill switch
-   g_equityHighWater = AccountInfoDouble(ACCOUNT_EQUITY);
+   g_equityHighWater  = AccountInfoDouble(ACCOUNT_EQUITY);
+   g_killSwitchFired  = false;
 
    if(!RefreshSeries()) return INIT_FAILED;
 
