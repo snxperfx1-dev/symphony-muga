@@ -850,7 +850,31 @@ void CloseOldestLots(int direction, double lotsToClose, const string tag)
    }
 }
 
-// Run profit ladder for one direction. Called every bar.
+// Close a fixed fraction from EVERY open position in direction proportionally.
+// Each position closes fractionPerPos of its own current lot size independently.
+// This ensures every leg captures partial profit at each rung — not just the oldest.
+void CloseProportionalAllPositions(int direction, double fractionPerPos, const string tag)
+{
+   if(fractionPerPos <= 0.0) return;
+   double minLot  = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
+   double lotStep = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
+
+   int total = PositionsTotal();
+   for(int i = 0; i < total; i++)
+   {
+      ulong ticket = PositionGetTicket(i);
+      if(!PositionSelectByTicket(ticket)) continue;
+      if(PositionGetString(POSITION_SYMBOL) != _Symbol)   continue;
+      if(PositionGetInteger(POSITION_MAGIC)  != InpMagic) continue;
+      long type = PositionGetInteger(POSITION_TYPE);
+      if((type == POSITION_TYPE_BUY ? 1 : -1) != direction) continue;
+
+      double lots      = PositionGetDouble(POSITION_VOLUME);
+      double closeThis = MathFloor((lots * fractionPerPos) / lotStep) * lotStep;
+      if(closeThis < minLot) continue;
+      ClosePositionPartial(ticket, closeThis, tag);
+   }
+}
 void RunProfitLadderDirection(int direction, int &rungs)
 {
    double totalLots = 0.0, totalRisk = 0.0, totalPnL = 0.0;
@@ -900,7 +924,7 @@ void RunProfitLadderDirection(int direction, int &rungs)
       double closeL = NormalizeDouble(totalLots * InpLadderFrac1, 2);
       Print("SYM LADDER Rung1 ",dirStr," ratio=",DoubleToString(ratio,2),
             " closing=",DoubleToString(closeL,2)," lots");
-      CloseOldestLots(direction, closeL, "SYM LADDER R1");
+      CloseProportionalAllPositions(direction, InpLadderFrac1, "SYM LADDER R1");
       rungs = 1;
       // Rung 1: move all remaining stops to breakeven immediately
       if(direction > 0) g_longBEActive  = true;
@@ -912,7 +936,7 @@ void RunProfitLadderDirection(int direction, int &rungs)
       double closeL = NormalizeDouble(totalLots * InpLadderFrac2, 2);
       Print("SYM LADDER Rung2 ",dirStr," ratio=",DoubleToString(ratio,2),
             " closing=",DoubleToString(closeL,2)," lots");
-      CloseOldestLots(direction, closeL, "SYM LADDER R2");
+      CloseProportionalAllPositions(direction, InpLadderFrac2, "SYM LADDER R2");
       rungs = 2;
       // Rung 2: activate trailing — locks InpTrailLockPct of move each bar
       if(direction > 0) { g_longBEActive = false;  g_longTrailActive  = true; }
@@ -923,7 +947,7 @@ void RunProfitLadderDirection(int direction, int &rungs)
       double closeL = NormalizeDouble(totalLots * InpLadderFrac3, 2);
       Print("SYM LADDER Rung3 ",dirStr," ratio=",DoubleToString(ratio,2),
             " closing=",DoubleToString(closeL,2)," lots");
-      CloseOldestLots(direction, closeL, "SYM LADDER R3");
+      CloseProportionalAllPositions(direction, InpLadderFrac3, "SYM LADDER R3");
       rungs = 3;
       // Rung 3: trail stays active on the final runner
    }
