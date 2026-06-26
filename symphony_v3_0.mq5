@@ -110,6 +110,25 @@ input bool   InpBlockJul          = true;   // Block July entries
 input bool   InpBlockAug          = true;   // Block August entries
 input bool   InpBlockDec          = true;   // Block December entries
 
+//==================================================================
+// 1G. LONDON-OPEN ASIA-RAID BIAS + PRE-NY BLOCK
+// Audit: hours 08-10 (London open) lose -50.9R across 280 trades -
+// the system fires into institutional London reversals. Instead of
+// blocking outright, gate London-open entries by the Asia liquidity
+// raid: if Asia LOW was swept -> buys only (downside grab, expect
+// reversal up); if Asia HIGH was taken -> sells only. If neither (or
+// both) swept, block London-open entries entirely.
+// Hour 14 (pre-NY lull, 26% WR, -5.1R) is blocked outright.
+//==================================================================
+input bool   InpAsiaRaidBias      = true;   // London-open Asia-raid directional gate
+input int    InpAsiaStartMin      = 0;      // Asia window start (GMT min, 00:00)
+input int    InpAsiaEndMin        = 420;    // Asia window end   (GMT min, 07:00)
+input int    InpLondonOpenStart   = 480;    // London-open gate start (08:00)
+input int    InpLondonOpenEnd     = 660;    // London-open gate end   (11:00)
+input bool   InpBlockPreNY        = true;   // Block 14:00-14:55 pre-NY lull
+input int    InpPreNYStart        = 840;    // 14:00
+input int    InpPreNYEnd          = 895;    // 14:55
+
 
 //==================================================================
 // 2. GLOBAL STATE - PHASE ENGINE
@@ -191,6 +210,19 @@ bool     g_shortTrailActive  = false; // trail short stops
 // 5. GLOBAL STATE - KILL SWITCH (removed)
 //==================================================================
 double   g_equityHighWater   = 0.0; // retained for reference only
+
+//==================================================================
+// 5B. GLOBAL STATE - ASIA RANGE / RAID BIAS
+// Tracks the Asia-session high/low each day and which side has been
+// raided (swept). London-open entries are then gated to the
+// reversal direction: low raided -> buys only, high raided -> sells.
+//==================================================================
+double   g_asiaHigh          = 0.0;
+double   g_asiaLow           = 0.0;
+int      g_asiaDay           = -1;    // day-of-year the current Asia range belongs to
+bool     g_asiaComplete      = false; // Asia window has finished for the day
+bool     g_raidedHigh        = false; // Asia high taken since Asia close
+bool     g_raidedLow         = false; // Asia low swept since Asia close
 
 
 //==================================================================
@@ -370,6 +402,9 @@ bool IsTradeTime()
    if(h <  0)  h += 24;
    if(h >= 24) h -= 24;
    int cur = h * 60 + m;
+
+   // Pre-NY lull block (14:00-14:55): hour 14 = 26% WR, -5.1R, false breakouts.
+   if(InpBlockPreNY && cur >= InpPreNYStart && cur <= InpPreNYEnd) return false;
 
    bool w1 = (cur >= 480  && cur <= 705);   // London AM 08:00-11:45
    bool w2 = (cur >= 705  && cur <= 735);   // UK micro 11:45-12:15
@@ -989,6 +1024,76 @@ void RunProfitLadder()
    RunProfitLadderDirection(-1, g_shortRungs);
 }
 
+//==================================================================
+// 13B. ASIA RANGE TRACKING + LONDON-OPEN RAID BIAS
+// Called every bar. Builds the Asia high/low (00:00-07:00 GMT),
+// then after Asia close watches for a sweep of either extreme.
+//==================================================================
+void UpdateAsiaRange()
+{
+   MqlDateTime g;
+   TimeGMT(g);
+   int cur = (g.hour + InpTargetGMT) * 60 + g.min;
+   if(cur < 0)    cur += 1440;
+   if(cur >= 1440) cur -= 1440;
+
+   int doy = g.day_of_year;
+   int shiftNow = 1;
+   double hi = High[shiftNow];
+   double lo = Low[shiftNow];
+   double px = Close[shiftNow];
+
+   // New day: reset everything at/after Asia start
+   if(doy != g_asiaDay && cur >= InpAsiaStartMin && cur < InpAsiaEndMin)
+   {
+      g_asiaDay      = doy;
+      g_asiaHigh     = hi;
+      g_asiaLow      = lo;
+      g_asiaComplete = false;
+      g_raidedHigh   = false;
+      g_raidedLow    = false;
+      return;
+   }
+
+   // Inside Asia window for the current day: extend range
+   if(doy == g_asiaDay && cur >= InpAsiaStartMin && cur < InpAsiaEndMin)
+   {
+      if(hi > g_asiaHigh) g_asiaHigh = hi;
+      if(lo < g_asiaLow || g_asiaLow == 0.0) g_asiaLow = lo;
+      return;
+   }
+
+   // After Asia close: mark complete and watch for raids
+   if(doy == g_asiaDay && cur >= InpAsiaEndMin)
+   {
+      g_asiaComplete = true;
+      if(g_asiaHigh > 0.0 && hi > g_asiaHigh) g_raidedHigh = true;
+      if(g_asiaLow  > 0.0 && lo < g_asiaLow)  g_raidedLow  = true;
+   }
+}
+
+// Returns +1 (buys only), -1 (sells only), 0 (block) for London-open window,
+// or 99 = no London-open restriction (outside the window / filter off).
+int LondonOpenBias()
+{
+   if(!InpAsiaRaidBias) return 99;
+   MqlDateTime g;
+   TimeGMT(g);
+   int cur = (g.hour + InpTargetGMT) * 60 + g.min;
+   if(cur < 0)    cur += 1440;
+   if(cur >= 1440) cur -= 1440;
+
+   // Only applies during the London-open gate window
+   if(cur < InpLondonOpenStart || cur >= InpLondonOpenEnd) return 99;
+   if(!g_asiaComplete) return 0;            // no Asia range yet -> block
+
+   // Most recent / exclusive raid decides direction
+   if(g_raidedLow && !g_raidedHigh)  return +1;  // low swept -> buys only
+   if(g_raidedHigh && !g_raidedLow)  return -1;  // high taken -> sells only
+   if(g_raidedLow && g_raidedHigh)   return 0;   // both swept -> ambiguous, block
+   return 0;                                     // neither swept -> block London open
+}
+
 
 //==================================================================
 // 14. EQUITY KILL SWITCH - REMOVED
@@ -1033,6 +1138,13 @@ void ExecuteTrading()
    bool longBookOpen  = (GetDirectionPositionCount( 1) > 0);
    if(shortBookOpen) { L3 = false; L4 = false; }
    if(longBookOpen)  { S3 = false; S4 = false; }
+
+   // London-open Asia-raid directional gate:
+   //  +1 buys only, -1 sells only, 0 block all, 99 no restriction.
+   int loBias = LondonOpenBias();
+   if(loBias == 0)       { L3=false; L4=false; S3=false; S4=false; }
+   else if(loBias == 1)  { S3=false; S4=false; }   // buys only
+   else if(loBias == -1) { L3=false; L4=false; }   // sells only
 
    // --- LONG P3 ---
    if(L3 && g_lastLongTradeTime != barTime)
@@ -1251,6 +1363,10 @@ int OnInit()
    // Kill switch removed
    g_equityHighWater = AccountInfoDouble(ACCOUNT_EQUITY);
 
+   // Asia-raid bias state
+   g_asiaHigh = 0.0; g_asiaLow = 0.0; g_asiaDay = -1;
+   g_asiaComplete = false; g_raidedHigh = false; g_raidedLow = false;
+
    if(!RefreshSeries()) return INIT_FAILED;
 
    Print("SYMPHONY v3.0 loaded.");
@@ -1272,6 +1388,9 @@ void OnTick()
    // 1. Update structure and phases
    //    (also sets g_modeInvalidatedLong/Short + g_phaseAtInvalidLong/Short)
    UpdatePhaseEngine();
+
+   // 1b. Update Asia range + raid flags (London-open bias gate)
+   UpdateAsiaRange();
 
    // 2. Update ARC target
    UpdateARC();
