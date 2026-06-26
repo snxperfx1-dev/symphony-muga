@@ -135,14 +135,13 @@ input ENUM_TIMEFRAMES InpHTFTimeframe  = PERIOD_D1;   // Higher timeframe
 input int             InpHTFEMAPeriod  = 50;          // HTF EMA period
 
 //==================================================================
-// 1I. R-2 VOLATILITY-REGIME FILTER
-// Audit: high-ATR entries net negative (-44.5R, -0.17R avg), monotonic.
-// Suppress ALL new entries when current ATR ranks in the top
-// InpVolBlockPctile of its recent distribution (expansion/whipsaw).
+// 1I. VOLATILITY REGIME (audit classification only)
+// The high-ATR entry FILTER was removed. IsHighVol() is retained
+// purely to tag each trade's volatility regime in the audit log,
+// so per-regime expectancy can still be measured from the journal.
 //==================================================================
-input bool   InpVolFilter         = true;   // Suppress entries in high-ATR state
-input int    InpVolLookback        = 100;    // Bars for ATR percentile ranking
-input double InpVolBlockPctile     = 0.66;   // Block if ATR rank >= this percentile
+input int    InpVolLookback        = 100;    // Bars for ATR percentile ranking (audit)
+input double InpVolBlockPctile     = 0.66;   // ATR rank threshold for 'high' tag (audit)
 
 //==================================================================
 // 1J. R-9 AUDIT INSTRUMENTATION
@@ -1081,9 +1080,10 @@ int HTFTrend()
 }
 
 //==================================================================
-// 13D. R-2 VOLATILITY REGIME
+// 13D. VOLATILITY REGIME (audit tag only - filter removed)
 // True if current ATR ranks at/above InpVolBlockPctile within the
-// last InpVolLookback bars (high-volatility / expansion state).
+// last InpVolLookback bars. Used only to label trades in the audit
+// log; it no longer blocks any entries.
 //==================================================================
 bool IsHighVol()
 {
@@ -1266,9 +1266,6 @@ void ExecuteTrading()
 
    // R-1: HTF trend gate on shorts. Block shorts unless HTF is down.
    if(InpHTFShortGate && HTFTrend() >= 0) { S3=false; S4=false; }
-
-   // R-2: volatility-regime filter. Suppress ALL entries in high-ATR state.
-   if(InpVolFilter && IsHighVol()) { L3=false; L4=false; S3=false; S4=false; }
 
    // --- LONG P3 ---
    if(L3 && g_lastLongTradeTime != barTime)
