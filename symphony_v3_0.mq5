@@ -960,11 +960,7 @@ void RunProfitLadder()
 
 
 //==================================================================
-// 14. EQUITY KILL SWITCH
-// Tracks equity high-water mark. If equity drops >= InpKillSwitchPct
-// below the high-water, close all positions and return true.
-// Caller (OnTick) skips remaining logic if kill fires.
-//==================================================================
+// 14. EQUITY KILL SWITCH - REMOVED
 // Kill switch removed — equity drawdown measured from floating high-water
 // is not a real balance drawdown. Profit ladder + trailing stops are the
 // correct mechanism for protecting captured gains.
@@ -1226,8 +1222,7 @@ int OnInit()
 
    Print("SYMPHONY v3.0 loaded.");
    Print("  InpRiskPercent=",     InpRiskPercent,
-         " InpMaxBasketRiskPct=", InpMaxBasketRiskPct,
-         " InpKillSwitchPct=",    InpKillSwitchPct);
+         " InpMaxBasketRiskPct=", InpMaxBasketRiskPct);
    Print("  Ladder rungs: ",InpLadderRung1,"x/",InpLadderRung2,"x/",InpLadderRung3,"x",
          " fracs: ",InpLadderFrac1,"/",InpLadderFrac2,"/",InpLadderFrac3);
    Print("  ArcExtMult=", InpArcExtMult, " (1.0 = impulse height target)");
